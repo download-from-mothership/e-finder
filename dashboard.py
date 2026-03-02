@@ -2,9 +2,8 @@
 """
 E-FINDER — Live Investigation Dashboard
 =========================================
-Flask app serving the entity relationship map + investigation reports
-with live MongoDB data. Designed to run on VPS and be shared via
-Cloudflare Tunnel.
+Flask app serving the full React dashboard UI with live MongoDB data.
+Designed to run on VPS and be shared via Cloudflare Tunnel.
 
 Usage:
   cd ~/efinder
@@ -13,24 +12,23 @@ Usage:
   python3 _pipeline_output/dashboard.py
 
   # Then in another tmux pane:
-  cloudflared tunnel --url http://localhost:5000
-  # → gives you a public https://xxx.trycloudflare.com URL to share
+  ~/efinder/cloudflared tunnel --url http://localhost:5000
 """
 
 import json
 import os
 import sys
-import time
+import threading
 from collections import defaultdict
 from datetime import datetime
 
 try:
-    from flask import Flask, render_template_string, jsonify, request
+    from flask import Flask, jsonify, request, Response
 except ImportError:
     import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install",
                           "flask", "--break-system-packages", "-q"])
-    from flask import Flask, render_template_string, jsonify, request
+    from flask import Flask, jsonify, request, Response
 
 try:
     from pymongo import MongoClient
@@ -44,7 +42,6 @@ except ImportError:
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
 DATABASE_NAME = "doj_investigation"
 PORT = int(os.environ.get("DASHBOARD_PORT", 5000))
-SECRET_KEY = os.environ.get("DASHBOARD_SECRET", "efinder-dashboard-2026")
 
 MAX_NODES = 300
 MAX_EDGES = 2000
@@ -52,9 +49,7 @@ MIN_EDGE_WEIGHT = 2
 
 # ─── App Setup ────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
 
-# MongoDB connection (lazy)
 _db = None
 
 def get_db():
@@ -66,11 +61,33 @@ def get_db():
     return _db
 
 
+# ─── Helpers ─────────────────────────────────────────────────────────
+
+def _classify_person_role(db, name):
+    """Classify a person's role based on their context fields in the entities collection."""
+    roles = list(db["entities"].find(
+        {"name": name, "entity_type": "person", "context": {"$ne": ""}},
+        {"context": 1, "_id": 0}
+    ).limit(5))
+    role_str = "; ".join(r.get("context", "")[:80] for r in roles if r.get("context"))
+    role_lower = role_str.lower()
+    if any(w in role_lower for w in ["attorney", "counsel", "lawyer", "judge", "magistrate"]):
+        return "legal", role_str[:150]
+    elif any(w in role_lower for w in ["victim", "plaintiff", "doe", "minor", "accuser"]):
+        return "victim", role_str[:150]
+    elif any(w in role_lower for w in ["defendant", "accused", "perpetrator", "co-conspirator"]):
+        return "defendant", role_str[:150]
+    elif any(w in role_lower for w in ["agent", "detective", "officer", "fbi", "investigator"]):
+        return "law_enforcement", role_str[:150]
+    elif any(w in role_lower for w in ["witness", "deponent"]):
+        return "witness", role_str[:150]
+    return "other", role_str[:150]
+
+
 # ─── API Routes ───────────────────────────────────────────────────────
 
 @app.route("/api/stats")
 def api_stats():
-    """Corpus statistics for the dashboard header."""
     db = get_db()
     return jsonify({
         "total_docs": db["documents"].count_documents({}),
@@ -84,18 +101,15 @@ def api_stats():
 
 @app.route("/api/network")
 def api_network():
-    """Live network data for the relationship map."""
     db = get_db()
     min_weight = int(request.args.get("min_weight", MIN_EDGE_WEIGHT))
     max_nodes = int(request.args.get("max_nodes", MAX_NODES))
 
-    # Load edges
     edges_raw = list(db["network"].find(
         {"weight": {"$gte": min_weight}},
         {"person1": 1, "person2": 1, "weight": 1, "shared_doc_ids": 1, "_id": 0}
     ).sort("weight", -1))
 
-    # Build node degrees
     node_degree = defaultdict(int)
     node_weighted_degree = defaultdict(int)
     for e in edges_raw:
@@ -104,11 +118,9 @@ def api_network():
         node_weighted_degree[e["person1"]] += e["weight"]
         node_weighted_degree[e["person2"]] += e["weight"]
 
-    # Top nodes
     top_nodes = sorted(node_weighted_degree.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
     node_set = set(n for n, _ in top_nodes)
 
-    # Filter edges
     edges = []
     for e in edges_raw:
         if e["person1"] in node_set and e["person2"] in node_set:
@@ -121,11 +133,9 @@ def api_network():
             if len(edges) >= MAX_EDGES:
                 break
 
-    # Build node metadata
     nodes = []
     for name in node_set:
         doc_count = db["entities"].count_documents({"name": name, "entity_type": "person"})
-
         section_pipeline = [
             {"$match": {"name": name, "entity_type": "person"}},
             {"$group": {"_id": "$section", "count": {"$sum": 1}}},
@@ -133,27 +143,7 @@ def api_network():
             {"$limit": 3},
         ]
         sections = [r["_id"] for r in db["entities"].aggregate(section_pipeline)]
-
-        roles = list(db["entities"].find(
-            {"name": name, "entity_type": "person", "context": {"$ne": ""}},
-            {"context": 1, "_id": 0}
-        ).limit(3))
-        role_str = "; ".join(r.get("context", "")[:80] for r in roles if r.get("context"))
-
-        role_lower = role_str.lower()
-        if any(w in role_lower for w in ["attorney", "counsel", "lawyer", "judge", "magistrate"]):
-            node_type = "legal"
-        elif any(w in role_lower for w in ["victim", "plaintiff", "doe", "minor", "accuser"]):
-            node_type = "victim"
-        elif any(w in role_lower for w in ["defendant", "accused", "perpetrator", "co-conspirator"]):
-            node_type = "defendant"
-        elif any(w in role_lower for w in ["agent", "detective", "officer", "fbi", "investigator"]):
-            node_type = "law_enforcement"
-        elif any(w in role_lower for w in ["witness", "deponent"]):
-            node_type = "witness"
-        else:
-            node_type = "other"
-
+        node_type, role_str = _classify_person_role(db, name)
         nodes.append({
             "id": name,
             "doc_count": doc_count,
@@ -169,7 +159,6 @@ def api_network():
 
 @app.route("/api/reports")
 def api_reports():
-    """List stored investigation reports."""
     db = get_db()
     reports = list(db["reports"].find(
         {},
@@ -181,11 +170,9 @@ def api_reports():
 
 @app.route("/api/top-entities")
 def api_top_entities():
-    """Top entities by document frequency."""
     db = get_db()
     entity_type = request.args.get("type", "person")
     limit = int(request.args.get("limit", 25))
-
     pipeline = [
         {"$match": {"entity_type": entity_type}},
         {"$group": {"_id": "$name", "count": {"$sum": 1}}},
@@ -193,596 +180,348 @@ def api_top_entities():
         {"$limit": limit},
     ]
     results = list(db["entities"].aggregate(pipeline))
-    return jsonify([{"name": r["_id"], "count": r["count"]} for r in results])
+    enriched = []
+    for r in results:
+        entry = {"name": r["_id"], "count": r["count"]}
+        if entity_type == "person":
+            role_type, role_desc = _classify_person_role(db, r["_id"])
+            entry["type"] = role_type
+            entry["role"] = role_desc
+        else:
+            entry["type"] = entity_type
+        enriched.append(entry)
+    return jsonify(enriched)
 
 
-# ─── Page Routes ──────────────────────────────────────────────────────
+@app.route("/api/entity-breakdown")
+def api_entity_breakdown():
+    db = get_db()
+    pipeline = [
+        {"$group": {"_id": "$entity_type", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+    ]
+    results = list(db["entities"].aggregate(pipeline))
+    return jsonify([{"type": r["_id"], "count": r["count"]} for r in results])
+
+
+# ─── Investigation state (in-memory) ─────────────────────────────────
+_investigations = {}  # job_id -> {status, result, error}
+
+@app.route("/api/investigate", methods=["POST"])
+def api_investigate():
+    """Start an investigation via the swarm coordinator."""
+    data = request.get_json()
+    question = data.get("question", "").strip()
+    if not question:
+        return jsonify({"error": "No question provided"}), 400
+
+    job_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    _investigations[job_id] = {"status": "running", "result": None, "error": None}
+
+    def run_investigation(jid, q):
+        try:
+            # Import swarm coordinator + anthropic
+            swarm_dir = os.path.dirname(os.path.abspath(__file__))
+            if swarm_dir not in sys.path:
+                sys.path.insert(0, swarm_dir)
+            import anthropic
+            from swarm import Coordinator
+
+            # Get db handle and create Claude client
+            db = get_db()
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY not set in environment")
+            claude_client = anthropic.Anthropic(api_key=api_key)
+
+            coord = Coordinator(db=db, claude_client=claude_client)
+            result = coord.investigate(q)
+            _investigations[jid]["status"] = "complete"
+            _investigations[jid]["result"] = result
+        except Exception as e:
+            _investigations[jid]["status"] = "error"
+            _investigations[jid]["error"] = str(e)
+
+    t = threading.Thread(target=run_investigation, args=(job_id, question))
+    t.daemon = True
+    t.start()
+
+    return jsonify({"job_id": job_id, "status": "running"})
+
+
+@app.route("/api/investigate/<job_id>")
+def api_investigate_status(job_id):
+    """Poll investigation status."""
+    job = _investigations.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job"}), 404
+
+    resp = {"job_id": job_id, "status": job["status"]}
+    if job["status"] == "complete" and job["result"]:
+        r = job["result"]
+        resp["result"] = {
+            "question": r.get("question", ""),
+            "executive_summary": r.get("executive_summary", ""),
+            "key_findings": r.get("key_findings", []),
+            "meta": r.get("meta", {}),
+        }
+    elif job["status"] == "error":
+        resp["error"] = job["error"]
+    return jsonify(resp)
+
+
+# ─── Main Page ────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
-    return render_template_string(DASHBOARD_HTML)
+    return Response(DASHBOARD_HTML, mimetype="text/html")
 
 
-@app.route("/network")
-def network_page():
-    return render_template_string(NETWORK_HTML)
+# ─── Full React Dashboard HTML ───────────────────────────────────────
 
-
-@app.route("/reports")
-def reports_page():
-    return render_template_string(REPORTS_HTML)
-
-
-# ─── HTML Templates ──────────────────────────────────────────────────
-
-COMMON_CSS = """
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #0a0a0f;
-    color: #e0e0e0;
-  }
-  a { color: #8b5cf6; text-decoration: none; }
-  a:hover { color: #a78bfa; text-decoration: underline; }
-
-  nav {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    z-index: 1000;
-    background: rgba(10, 10, 15, 0.95);
-    backdrop-filter: blur(12px);
-    border-bottom: 1px solid #1a1a2e;
-    padding: 0 24px;
-    display: flex;
-    align-items: center;
-    height: 52px;
-  }
-  nav .brand {
-    font-size: 15px;
-    font-weight: 700;
-    color: #8b5cf6;
-    letter-spacing: 1px;
-    margin-right: 32px;
-  }
-  nav .links a {
-    color: #888;
-    font-size: 13px;
-    font-weight: 500;
-    margin-right: 24px;
-    transition: color 0.2s;
-  }
-  nav .links a:hover, nav .links a.active {
-    color: #e0e0e0;
-    text-decoration: none;
-  }
-  nav .badge {
-    font-size: 11px;
-    color: #666;
-    margin-left: auto;
-  }
-
-  .page { padding-top: 52px; }
-"""
-
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>E-FINDER — Investigation Dashboard</title>
-<style>
-""" + COMMON_CSS + """
-  .hero {
-    padding: 48px 32px 32px;
-    text-align: center;
-  }
-  .hero h1 {
-    font-size: 28px;
-    font-weight: 700;
-    color: #fff;
-    margin-bottom: 8px;
-  }
-  .hero p {
-    color: #888;
-    font-size: 15px;
-    max-width: 600px;
-    margin: 0 auto;
-  }
-
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 16px;
-    padding: 0 32px 32px;
-    max-width: 900px;
-    margin: 0 auto;
-  }
-  .stat-card {
-    background: rgba(15, 15, 25, 0.8);
-    border: 1px solid #1a1a2e;
-    border-radius: 10px;
-    padding: 20px;
-    text-align: center;
-  }
-  .stat-card .number {
-    font-size: 32px;
-    font-weight: 700;
-    color: #8b5cf6;
-  }
-  .stat-card .label {
-    font-size: 13px;
-    color: #888;
-    margin-top: 4px;
-  }
-
-  .nav-cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: 16px;
-    padding: 0 32px 48px;
-    max-width: 900px;
-    margin: 0 auto;
-  }
-  .nav-card {
-    display: block;
-    background: rgba(15, 15, 25, 0.8);
-    border: 1px solid #1a1a2e;
-    border-radius: 10px;
-    padding: 24px;
-    transition: all 0.2s;
-  }
-  .nav-card:hover {
-    border-color: #8b5cf6;
-    transform: translateY(-2px);
-    text-decoration: none;
-  }
-  .nav-card h3 {
-    font-size: 16px;
-    color: #fff;
-    margin-bottom: 8px;
-  }
-  .nav-card p {
-    font-size: 13px;
-    color: #888;
-    line-height: 1.5;
-  }
-  .nav-card .icon {
-    font-size: 28px;
-    margin-bottom: 12px;
-  }
-
-  .top-entities {
-    max-width: 900px;
-    margin: 0 auto;
-    padding: 0 32px 48px;
-  }
-  .top-entities h2 {
-    font-size: 18px;
-    color: #fff;
-    margin-bottom: 16px;
-  }
-  .entity-bar {
-    display: flex;
-    align-items: center;
-    margin-bottom: 8px;
-  }
-  .entity-bar .name {
-    width: 200px;
-    font-size: 13px;
-    color: #ccc;
-    text-align: right;
-    padding-right: 12px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .entity-bar .bar-bg {
-    flex: 1;
-    height: 20px;
-    background: #111;
-    border-radius: 4px;
-    overflow: hidden;
-  }
-  .entity-bar .bar-fill {
-    height: 100%;
-    background: linear-gradient(90deg, #8b5cf6, #6d28d9);
-    border-radius: 4px;
-    transition: width 0.6s ease;
-  }
-  .entity-bar .count {
-    width: 60px;
-    font-size: 12px;
-    color: #666;
-    padding-left: 8px;
-  }
-
-  .footer {
-    text-align: center;
-    padding: 24px;
-    color: #444;
-    font-size: 12px;
-    border-top: 1px solid #111;
-  }
-</style>
-</head>
-<body>
-
-<nav>
-  <span class="brand">E-FINDER</span>
-  <div class="links">
-    <a href="/" class="active">Dashboard</a>
-    <a href="/network">Relationship Map</a>
-    <a href="/reports">Reports</a>
-  </div>
-  <span class="badge" id="last-update"></span>
-</nav>
-
-<div class="page">
-  <div class="hero">
-    <h1>DOJ Epstein Document Investigation</h1>
-    <p>AI-powered analysis of 26,138 documents from the Department of Justice Epstein document release</p>
-  </div>
-
-  <div class="stats-grid">
-    <div class="stat-card">
-      <div class="number" id="s-docs">—</div>
-      <div class="label">Documents Analyzed</div>
-    </div>
-    <div class="stat-card">
-      <div class="number" id="s-entities">—</div>
-      <div class="label">Entities Extracted</div>
-    </div>
-    <div class="stat-card">
-      <div class="number" id="s-connections">—</div>
-      <div class="label">Network Connections</div>
-    </div>
-    <div class="stat-card">
-      <div class="number" id="s-reports">—</div>
-      <div class="label">Investigation Reports</div>
-    </div>
-  </div>
-
-  <div class="nav-cards">
-    <a href="/network" class="nav-card">
-      <div class="icon">🕸️</div>
-      <h3>Entity Relationship Map</h3>
-      <p>Interactive force-directed graph showing connections between people across the document corpus. Search, filter, and explore the network.</p>
-    </a>
-    <a href="/reports" class="nav-card">
-      <div class="icon">📋</div>
-      <h3>Investigation Reports</h3>
-      <p>AI-generated investigation reports from the agent swarm — financial connections, timelines, redaction analysis, and more.</p>
-    </a>
-  </div>
-
-  <div class="top-entities">
-    <h2>Most Referenced People</h2>
-    <div id="entity-bars"></div>
-  </div>
-
-  <div class="footer">
-    E-FINDER Investigation Dashboard &middot; Data from DOJ document releases &middot; Analysis powered by Claude
-  </div>
-</div>
-
-<script>
-function fmt(n) {
-  return n >= 1000 ? (n/1000).toFixed(1) + 'k' : n.toString();
-}
-
-fetch('/api/stats')
-  .then(r => r.json())
-  .then(d => {
-    document.getElementById('s-docs').textContent = fmt(d.extracted_docs);
-    document.getElementById('s-entities').textContent = fmt(d.total_entities);
-    document.getElementById('s-connections').textContent = fmt(d.network_edges);
-    document.getElementById('s-reports').textContent = d.reports;
-    document.getElementById('last-update').textContent =
-      'Data as of ' + new Date(d.generated_at).toLocaleDateString();
-  });
-
-fetch('/api/top-entities?type=person&limit=15')
-  .then(r => r.json())
-  .then(data => {
-    const maxCount = data[0]?.count || 1;
-    const container = document.getElementById('entity-bars');
-    data.forEach(d => {
-      const pct = (d.count / maxCount * 100).toFixed(1);
-      container.innerHTML += `
-        <div class="entity-bar">
-          <div class="name">${d.name}</div>
-          <div class="bar-bg"><div class="bar-fill" style="width:${pct}%"></div></div>
-          <div class="count">${d.count} docs</div>
-        </div>`;
-    });
-  });
-</script>
-</body>
-</html>"""
-
-
-# ─── Network Map Page ─────────────────────────────────────────────────
-
-NETWORK_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>E-FINDER — Relationship Map</title>
-<style>
-""" + COMMON_CSS + """
-  body { overflow: hidden; }
-
-  #controls {
-    position: fixed;
-    top: 64px;
-    left: 16px;
-    z-index: 100;
-    background: rgba(15, 15, 25, 0.95);
-    border: 1px solid #1a1a2e;
-    border-radius: 8px;
-    padding: 16px;
-    width: 260px;
-    font-size: 13px;
-  }
-  #controls h3 {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: #8b5cf6;
-    margin-bottom: 12px;
-  }
-  #controls label {
-    display: block;
-    margin-bottom: 8px;
-    color: #999;
-  }
-  #controls input[type=range] {
-    width: 100%;
-    margin: 4px 0 12px;
-    accent-color: #8b5cf6;
-  }
-  #controls input[type=text] {
-    width: 100%;
-    padding: 6px 10px;
-    background: #111;
-    border: 1px solid #333;
-    border-radius: 4px;
-    color: #e0e0e0;
-    font-size: 13px;
-    margin-bottom: 12px;
-  }
-  .legend {
-    margin-top: 16px;
-    padding-top: 12px;
-    border-top: 1px solid #1a1a2e;
-  }
-  .legend-item {
-    display: flex;
-    align-items: center;
-    margin-bottom: 6px;
-    font-size: 12px;
-  }
-  .legend-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    margin-right: 8px;
-    flex-shrink: 0;
-  }
-  #loading {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    color: #8b5cf6;
-    font-size: 16px;
-    z-index: 200;
-  }
-  #tooltip {
-    position: fixed;
-    display: none;
-    background: rgba(15, 15, 25, 0.97);
-    border: 1px solid #8b5cf6;
-    border-radius: 8px;
-    padding: 12px 16px;
-    font-size: 13px;
-    max-width: 350px;
-    z-index: 200;
-    pointer-events: none;
-  }
-  #tooltip .name { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 6px; }
-  #tooltip .meta { color: #999; margin-bottom: 3px; }
-  #tooltip .role { color: #8b5cf6; font-style: italic; margin-top: 6px; }
-  svg { width: 100vw; height: 100vh; }
-</style>
-</head>
-<body>
-
-<nav>
-  <span class="brand">E-FINDER</span>
-  <div class="links">
-    <a href="/">Dashboard</a>
-    <a href="/network" class="active">Relationship Map</a>
-    <a href="/reports">Reports</a>
-  </div>
-  <span class="badge">
-    <span id="node-count">—</span> people &middot;
-    <span id="edge-count">—</span> connections
-  </span>
-</nav>
-
-<div id="loading">Loading network data...</div>
-
-<div id="controls" style="display:none">
-  <h3>Filters</h3>
-  <label>Search:
-    <input type="text" id="search" placeholder="Type a name...">
-  </label>
-  <label>Min connections: <span id="min-deg-val">2</span>
-    <input type="range" id="min-degree" min="1" max="50" value="2">
-  </label>
-  <label>Min edge weight: <span id="min-wt-val">2</span>
-    <input type="range" id="min-weight" min="1" max="30" value="2">
-  </label>
-  <div class="legend">
-    <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div> Defendant</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div> Legal</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div> Victim</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#10b981"></div> Law Enforcement</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#a855f7"></div> Witness</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#6b7280"></div> Other</div>
-  </div>
-</div>
-
-<div id="tooltip">
-  <div class="name"></div>
-  <div class="meta docs"></div>
-  <div class="meta connections"></div>
-  <div class="meta sections"></div>
-  <div class="role"></div>
-</div>
-
-<svg></svg>
-
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
-<script>
-const typeColors = {
-  defendant: "#ef4444",
-  legal: "#3b82f6",
-  victim: "#f59e0b",
-  law_enforcement: "#10b981",
-  witness: "#a855f7",
-  other: "#6b7280",
+<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0f; color: #e0e0e0; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #0a0a0f; }
+  ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  .stat-number { font-size: 28px; font-weight: 700; color: #8b5cf6; }
+  .brand { font-size: 15px; font-weight: 700; color: #8b5cf6; letter-spacing: 1px; }
+  .tab-active { background: rgba(255,255,255,0.08); color: #e0e0e0; }
+  .tab-inactive { color: #666; }
+  .tab-inactive:hover { color: #aaa; }
+  .card { background: rgba(15,15,25,0.8); border: 1px solid #1a1a2e; border-radius: 10px; }
+  .card:hover { border-color: #2a2a4e; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .bar-fill { transition: width 1s ease; }
+  .finding-card { background: rgba(139,92,246,0.06); border-left: 3px solid #8b5cf6; }
+  #network-svg { width: 100%; height: 100%; }
+
+  /* D3 tooltip */
+  #d3-tooltip {
+    position: fixed; display: none; background: rgba(15,15,25,0.97);
+    border: 1px solid #8b5cf6; border-radius: 8px; padding: 12px 16px;
+    font-size: 13px; max-width: 350px; z-index: 9999; pointer-events: none;
+  }
+  #d3-tooltip .tt-name { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 6px; }
+  #d3-tooltip .tt-meta { color: #999; margin-bottom: 3px; }
+  #d3-tooltip .tt-role { color: #8b5cf6; font-style: italic; margin-top: 6px; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+</style>
+</head>
+<body>
+
+<div id="d3-tooltip">
+  <div class="tt-name"></div>
+  <div class="tt-meta tt-docs"></div>
+  <div class="tt-meta tt-conns"></div>
+  <div class="tt-meta tt-sections"></div>
+  <div class="tt-role"></div>
+</div>
+
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const TYPE_COLORS = {
+  defendant: "#ef4444", legal: "#3b82f6", victim: "#f59e0b",
+  law_enforcement: "#10b981", witness: "#a855f7", other: "#6b7280",
+};
+const ENTITY_COLORS = {
+  person: "#8b5cf6", organization: "#3b82f6", location: "#10b981",
+  date_event: "#f59e0b", financial: "#ef4444",
 };
 
-fetch('/api/network')
-  .then(r => r.json())
-  .then(data => {
-    document.getElementById('loading').style.display = 'none';
-    document.getElementById('controls').style.display = 'block';
-    buildGraph(data.nodes, data.edges);
-  })
-  .catch(err => {
-    document.getElementById('loading').textContent = 'Error loading data: ' + err.message;
-  });
+// ─── Hooks ───
+function useFetch(url) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    setLoading(true);
+    fetch(url).then(r => r.json()).then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [url]);
+  return { data, loading };
+}
 
-function buildGraph(rawNodes, rawEdges) {
-  const width = window.innerWidth;
-  const height = window.innerHeight;
+// ─── Components ───
 
-  const svg = d3.select("svg").attr("width", width).attr("height", height);
-  const g = svg.append("g");
+function StatCard({ label, value, icon }) {
+  const fmt = typeof value === 'number'
+    ? (value >= 1000 ? (value/1000).toFixed(1) + 'k' : value.toString()) : value || '—';
+  return (
+    <div className="card p-5 text-center">
+      <div style={{fontSize: '28px'}} className="mb-1">{icon}</div>
+      <div className="stat-number">{fmt}</div>
+      <div style={{fontSize: '12px', color: '#666', marginTop: '4px'}}>{label}</div>
+    </div>
+  );
+}
 
-  const zoom = d3.zoom()
-    .scaleExtent([0.1, 8])
-    .on("zoom", (e) => g.attr("transform", e.transform));
-  svg.call(zoom);
+function EntityBar({ name, count, maxCount, type }) {
+  const pct = (count / maxCount * 100).toFixed(1);
+  const color = TYPE_COLORS[type] || TYPE_COLORS.other;
+  return (
+    <div style={{display: 'flex', alignItems: 'center', marginBottom: '8px'}}>
+      <div className="legend-dot" style={{background: color, marginRight: '8px'}}></div>
+      <div style={{width: '140px', fontSize: '12px', color: '#ccc', overflow: 'hidden',
+        textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>{name}</div>
+      <div style={{flex: 1, height: '16px', background: '#111', borderRadius: '4px',
+        overflow: 'hidden', margin: '0 8px'}}>
+        <div className="bar-fill" style={{height: '100%', width: pct+'%',
+          background: `linear-gradient(90deg, ${color}88, ${color})`, borderRadius: '4px'}}></div>
+      </div>
+      <div style={{width: '55px', fontSize: '11px', color: '#666', textAlign: 'right'}}>
+        {count.toLocaleString()}
+      </div>
+    </div>
+  );
+}
 
-  let nodes = rawNodes.map(d => ({...d}));
-  let edges = rawEdges.map(d => ({...d}));
+// ─── Network Map (full D3) ───
+function NetworkMap() {
+  const svgRef = useRef(null);
+  const [loading, setLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [minDegree, setMinDegree] = useState(2);
+  const [minWeight, setMinWeight] = useState(2);
+  const simRef = useRef(null);
+  const dataRef = useRef(null);
 
-  const sizeScale = d3.scaleSqrt()
-    .domain([1, d3.max(nodes, d => d.weighted_degree)])
-    .range([3, 28]);
-
-  const edgeWidthScale = d3.scaleLinear()
-    .domain([1, d3.max(edges, d => d.weight)])
-    .range([0.3, 3]);
-
-  const simulation = d3.forceSimulation(nodes)
-    .force("link", d3.forceLink(edges).id(d => d.id).distance(80).strength(d => Math.min(d.weight / 20, 0.5)))
-    .force("charge", d3.forceManyBody().strength(-120))
-    .force("center", d3.forceCenter(width / 2, height / 2))
-    .force("collision", d3.forceCollide().radius(d => sizeScale(d.weighted_degree) + 2))
-    .alphaDecay(0.02);
-
-  let linkGroup = g.append("g").attr("class", "links");
-  let link = linkGroup.selectAll("line")
-    .data(edges).join("line")
-    .attr("stroke", "#1a1a3e")
-    .attr("stroke-width", d => edgeWidthScale(d.weight))
-    .attr("stroke-opacity", 0.4);
-
-  let nodeGroup = g.append("g").attr("class", "nodes");
-  let node = nodeGroup.selectAll("circle")
-    .data(nodes).join("circle")
-    .attr("r", d => sizeScale(d.weighted_degree))
-    .attr("fill", d => typeColors[d.type] || typeColors.other)
-    .attr("fill-opacity", 0.85)
-    .attr("stroke", "#000")
-    .attr("stroke-width", 0.5)
-    .style("cursor", "pointer")
-    .call(d3.drag()
-      .on("start", (e, d) => { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-      .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
-      .on("end", (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }));
-
-  let labelGroup = g.append("g").attr("class", "labels");
-  let label = labelGroup.selectAll("text")
-    .data(nodes.filter(d => d.degree >= 15))
-    .join("text")
-    .text(d => d.id)
-    .attr("font-size", d => Math.max(9, Math.min(14, d.degree / 3)))
-    .attr("fill", "#ccc")
-    .attr("text-anchor", "middle")
-    .attr("dy", d => -sizeScale(d.weighted_degree) - 4)
-    .style("pointer-events", "none")
-    .style("text-shadow", "0 0 4px #000, 0 0 8px #000");
-
-  const tooltip = d3.select("#tooltip");
-
-  node.on("mouseover", (event, d) => {
-    tooltip.style("display", "block")
-      .style("left", (event.clientX + 16) + "px")
-      .style("top", (event.clientY - 10) + "px");
-    tooltip.select(".name").text(d.id);
-    tooltip.select(".docs").text("Documents: " + d.doc_count);
-    tooltip.select(".connections").text("Connections: " + d.degree + " (" + d.weighted_degree + " weighted)");
-    tooltip.select(".sections").text("Sections: " + (d.sections || []).join(", "));
-    tooltip.select(".role").text(d.role || "");
-
-    const connected = new Set();
-    edges.forEach(e => {
-      const s = typeof e.source === "object" ? e.source.id : e.source;
-      const t = typeof e.target === "object" ? e.target.id : e.target;
-      if (s === d.id) connected.add(t);
-      if (t === d.id) connected.add(s);
+  useEffect(() => {
+    fetch('/api/network').then(r => r.json()).then(data => {
+      setLoading(false);
+      dataRef.current = data;
+      buildGraph(data);
     });
-    node.attr("fill-opacity", n => n.id === d.id || connected.has(n.id) ? 1 : 0.08);
-    link.attr("stroke-opacity", e => {
-      const s = typeof e.source === "object" ? e.source.id : e.source;
-      const t = typeof e.target === "object" ? e.target.id : e.target;
-      return s === d.id || t === d.id ? 0.7 : 0.03;
-    }).attr("stroke", e => {
-      const s = typeof e.source === "object" ? e.source.id : e.source;
-      const t = typeof e.target === "object" ? e.target.id : e.target;
-      return s === d.id || t === d.id ? "#8b5cf6" : "#1a1a3e";
+    return () => { if (simRef.current) simRef.current.stop(); };
+  }, []);
+
+  function buildGraph(data) {
+    const svg = d3.select(svgRef.current);
+    svg.selectAll("*").remove();
+    const container = svgRef.current.parentElement;
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+    svg.attr("width", width).attr("height", height);
+
+    const g = svg.append("g");
+    const zoom = d3.zoom().scaleExtent([0.1, 8])
+      .on("zoom", (e) => g.attr("transform", e.transform));
+    svg.call(zoom);
+
+    const nodes = data.nodes.map(d => ({...d}));
+    const edges = data.edges.map(d => ({...d}));
+
+    const sizeScale = d3.scaleSqrt()
+      .domain([1, d3.max(nodes, d => d.weighted_degree) || 1]).range([3, 28]);
+    const edgeWidthScale = d3.scaleLinear()
+      .domain([1, d3.max(edges, d => d.weight) || 1]).range([0.3, 3]);
+
+    const simulation = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(edges).id(d => d.id).distance(80)
+        .strength(d => Math.min(d.weight / 20, 0.5)))
+      .force("charge", d3.forceManyBody().strength(-120))
+      .force("center", d3.forceCenter(width / 2, height / 2))
+      .force("collision", d3.forceCollide().radius(d => sizeScale(d.weighted_degree) + 2))
+      .alphaDecay(0.02);
+    simRef.current = simulation;
+
+    const link = g.append("g").selectAll("line").data(edges).join("line")
+      .attr("stroke", "#1a1a3e").attr("stroke-width", d => edgeWidthScale(d.weight))
+      .attr("stroke-opacity", 0.4);
+
+    const node = g.append("g").selectAll("circle").data(nodes).join("circle")
+      .attr("r", d => sizeScale(d.weighted_degree))
+      .attr("fill", d => TYPE_COLORS[d.type] || TYPE_COLORS.other)
+      .attr("fill-opacity", 0.85).attr("stroke", "#000").attr("stroke-width", 0.5)
+      .style("cursor", "pointer")
+      .call(d3.drag()
+        .on("start", (e, d) => { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+        .on("drag", (e, d) => { d.fx=e.x; d.fy=e.y; })
+        .on("end", (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx=null; d.fy=null; }));
+
+    const label = g.append("g").selectAll("text")
+      .data(nodes.filter(d => d.degree >= 15)).join("text")
+      .text(d => d.id)
+      .attr("font-size", d => Math.max(9, Math.min(14, d.degree / 3)))
+      .attr("fill", "#ccc").attr("text-anchor", "middle")
+      .attr("dy", d => -sizeScale(d.weighted_degree) - 4)
+      .style("pointer-events", "none")
+      .style("text-shadow", "0 0 4px #000, 0 0 8px #000");
+
+    const tooltip = d3.select("#d3-tooltip");
+
+    node.on("mouseover", (event, d) => {
+      tooltip.style("display", "block")
+        .style("left", (event.clientX + 16) + "px")
+        .style("top", (event.clientY - 10) + "px");
+      tooltip.select(".tt-name").text(d.id);
+      tooltip.select(".tt-docs").text("Documents: " + d.doc_count);
+      tooltip.select(".tt-conns").text("Connections: " + d.degree + " (" + d.weighted_degree + " weighted)");
+      tooltip.select(".tt-sections").text("Sections: " + (d.sections || []).join(", "));
+      tooltip.select(".tt-role").text(d.role || "");
+      const connected = new Set();
+      edges.forEach(e => {
+        const s = typeof e.source === "object" ? e.source.id : e.source;
+        const t = typeof e.target === "object" ? e.target.id : e.target;
+        if (s === d.id) connected.add(t);
+        if (t === d.id) connected.add(s);
+      });
+      node.attr("fill-opacity", n => n.id === d.id || connected.has(n.id) ? 1 : 0.08);
+      link.attr("stroke-opacity", e => {
+        const s = typeof e.source === "object" ? e.source.id : e.source;
+        const t = typeof e.target === "object" ? e.target.id : e.target;
+        return s === d.id || t === d.id ? 0.7 : 0.03;
+      }).attr("stroke", e => {
+        const s = typeof e.source === "object" ? e.source.id : e.source;
+        const t = typeof e.target === "object" ? e.target.id : e.target;
+        return s === d.id || t === d.id ? "#8b5cf6" : "#1a1a3e";
+      });
+      label.attr("fill-opacity", n => n.id === d.id || connected.has(n.id) ? 1 : 0.1);
+    }).on("mouseout", () => {
+      tooltip.style("display", "none");
+      node.attr("fill-opacity", 0.85);
+      link.attr("stroke-opacity", 0.4).attr("stroke", "#1a1a3e");
+      label.attr("fill-opacity", 1);
     });
-    label.attr("fill-opacity", n => n.id === d.id || connected.has(n.id) ? 1 : 0.1);
-  })
-  .on("mouseout", () => {
-    tooltip.style("display", "none");
-    node.attr("fill-opacity", 0.85);
-    link.attr("stroke-opacity", 0.4).attr("stroke", "#1a1a3e");
-    label.attr("fill-opacity", 1);
-  });
 
-  simulation.on("tick", () => {
-    link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-        .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-    node.attr("cx", d => d.x).attr("cy", d => d.y);
-    label.attr("x", d => d.x).attr("y", d => d.y);
-  });
+    simulation.on("tick", () => {
+      link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+          .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+      node.attr("cx", d => d.x).attr("cy", d => d.y);
+      label.attr("x", d => d.x).attr("y", d => d.y);
+    });
 
-  document.getElementById("node-count").textContent = nodes.length;
-  document.getElementById("edge-count").textContent = edges.length;
+    // Center on Epstein
+    setTimeout(() => {
+      const ep = nodes.find(n => n.id === "Jeffrey Epstein");
+      if (ep) {
+        const t = d3.zoomIdentity.translate(width/2, height/2).scale(1.5).translate(-ep.x, -ep.y);
+        svg.transition().duration(1000).call(zoom.transform, t);
+      }
+    }, 3000);
 
-  // Search
-  document.getElementById("search").addEventListener("input", function() {
-    const q = this.value.toLowerCase();
+    // Store refs for search/filter
+    dataRef.current = { nodes, edges, node, link, label, sizeScale };
+  }
+
+  useEffect(() => {
+    if (!dataRef.current || !dataRef.current.node) return;
+    const { nodes, edges, node, link, label } = dataRef.current;
+    const q = searchQuery.toLowerCase();
     if (!q) {
       node.attr("fill-opacity", 0.85);
       link.attr("stroke-opacity", 0.4).attr("stroke", "#1a1a3e");
@@ -805,184 +544,478 @@ function buildGraph(rawNodes, rawEdges) {
       return matches.has(s) || matches.has(t) ? 0.6 : 0.02;
     });
     label.attr("fill-opacity", n => matches.has(n.id) ? 1 : connected.has(n.id) ? 0.6 : 0.05);
-  });
+  }, [searchQuery]);
 
-  // Degree filter
-  document.getElementById("min-degree").addEventListener("input", function() {
-    document.getElementById("min-deg-val").textContent = this.value;
-    updateVisibility();
-  });
-  document.getElementById("min-weight").addEventListener("input", function() {
-    document.getElementById("min-wt-val").textContent = this.value;
-    updateVisibility();
-  });
-
-  function updateVisibility() {
-    const minDeg = +document.getElementById("min-degree").value;
-    const minWt = +document.getElementById("min-weight").value;
-    const visibleNodes = new Set();
-    nodes.forEach(n => { if (n.degree >= minDeg) visibleNodes.add(n.id); });
-    node.attr("display", n => visibleNodes.has(n.id) ? null : "none");
-    label.attr("display", n => visibleNodes.has(n.id) && n.degree >= 15 ? null : "none");
-    link.attr("display", e => {
-      const s = typeof e.source === "object" ? e.source.id : e.source;
-      const t = typeof e.target === "object" ? e.target.id : e.target;
-      return visibleNodes.has(s) && visibleNodes.has(t) && e.weight >= minWt ? null : "none";
-    });
-    const vn = nodes.filter(n => visibleNodes.has(n.id)).length;
-    const ve = edges.filter(e => {
-      const s = typeof e.source === "object" ? e.source.id : e.source;
-      const t = typeof e.target === "object" ? e.target.id : e.target;
-      return visibleNodes.has(s) && visibleNodes.has(t) && e.weight >= minWt;
-    }).length;
-    document.getElementById("node-count").textContent = vn;
-    document.getElementById("edge-count").textContent = ve;
-  }
-
-  // Center on Epstein
-  setTimeout(() => {
-    const epstein = nodes.find(n => n.id === "Jeffrey Epstein");
-    if (epstein) {
-      const transform = d3.zoomIdentity
-        .translate(width / 2, height / 2)
-        .scale(1.5)
-        .translate(-epstein.x, -epstein.y);
-      svg.transition().duration(1000).call(zoom.transform, transform);
-    }
-  }, 3000);
+  return (
+    <div style={{position: 'relative', width: '100%', height: 'calc(100vh - 48px)', background: '#050508'}}>
+      {loading && <div style={{position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%,-50%)',
+        color: '#8b5cf6', fontSize: '16px', zIndex: 100}}>Loading network data...</div>}
+      {/* Controls overlay */}
+      <div style={{position: 'absolute', top: '16px', left: '16px', zIndex: 100, background: 'rgba(15,15,25,0.95)',
+        border: '1px solid #1a1a2e', borderRadius: '8px', padding: '16px', width: '260px', fontSize: '13px'}}>
+        <div style={{fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px', color: '#8b5cf6',
+          marginBottom: '12px', fontWeight: 600}}>Filters</div>
+        <div style={{color: '#999', marginBottom: '4px'}}>Search:</div>
+        <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+          placeholder="Type a name..."
+          style={{width: '100%', padding: '6px 10px', background: '#111', border: '1px solid #333',
+            borderRadius: '4px', color: '#e0e0e0', fontSize: '13px', marginBottom: '12px', outline: 'none'}} />
+        <div style={{color: '#999', marginBottom: '4px'}}>Min connections: {minDegree}</div>
+        <input type="range" min="1" max="50" value={minDegree}
+          onChange={e => setMinDegree(+e.target.value)}
+          style={{width: '100%', marginBottom: '12px', accentColor: '#8b5cf6'}} />
+        <div style={{color: '#999', marginBottom: '4px'}}>Min edge weight: {minWeight}</div>
+        <input type="range" min="1" max="30" value={minWeight}
+          onChange={e => setMinWeight(+e.target.value)}
+          style={{width: '100%', marginBottom: '16px', accentColor: '#8b5cf6'}} />
+        <div style={{borderTop: '1px solid #1a1a2e', paddingTop: '12px'}}>
+          {Object.entries(TYPE_COLORS).map(([type, color]) => (
+            <div key={type} style={{display: 'flex', alignItems: 'center', marginBottom: '6px', fontSize: '12px'}}>
+              <div className="legend-dot" style={{background: color, marginRight: '8px'}}></div>
+              <span style={{textTransform: 'capitalize'}}>{type.replace('_', ' ')}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <svg ref={svgRef} id="network-svg"></svg>
+    </div>
+  );
 }
-</script>
-</body>
-</html>"""
 
+// ─── Investigation Panel ───
+function InvestigationPanel() {
+  const [query, setQuery] = useState('');
+  const [running, setRunning] = useState(false);
+  const [jobId, setJobId] = useState(null);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
 
-# ─── Reports Page ─────────────────────────────────────────────────────
+  const presets = [
+    "Who are the most connected people outside Epstein's inner circle?",
+    "What financial entities appear across multiple document sections?",
+    "Which documents have the heaviest redactions and why?",
+    "Map the timeline of the plea deal negotiations",
+    "What travel patterns emerge from the flight logs?",
+  ];
 
-REPORTS_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>E-FINDER — Investigation Reports</title>
-<style>
-""" + COMMON_CSS + """
-  .content {
-    max-width: 900px;
-    margin: 0 auto;
-    padding: 72px 32px 48px;
-  }
-  .content h1 {
-    font-size: 24px;
-    color: #fff;
-    margin-bottom: 8px;
-  }
-  .content .subtitle {
-    color: #888;
-    font-size: 14px;
-    margin-bottom: 32px;
+  function handleRun(q) {
+    if (!q || running) return;
+    setRunning(true);
+    setResult(null);
+    setError(null);
+    setElapsed(0);
+    const startTime = Date.now();
+    const timer = setInterval(() => setElapsed(((Date.now() - startTime) / 1000).toFixed(1)), 500);
+
+    fetch('/api/investigate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question: q}),
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { setError(data.error); setRunning(false); clearInterval(timer); return; }
+      setJobId(data.job_id);
+      // Poll for results
+      const poll = setInterval(() => {
+        fetch('/api/investigate/' + data.job_id)
+          .then(r => r.json())
+          .then(status => {
+            if (status.status === 'complete') {
+              clearInterval(poll);
+              clearInterval(timer);
+              setResult(status.result);
+              setRunning(false);
+            } else if (status.status === 'error') {
+              clearInterval(poll);
+              clearInterval(timer);
+              setError(status.error);
+              setRunning(false);
+            }
+          });
+      }, 2000);
+    })
+    .catch(e => { setError(e.message); setRunning(false); clearInterval(timer); });
   }
 
-  .report-card {
-    background: rgba(15, 15, 25, 0.8);
-    border: 1px solid #1a1a2e;
-    border-radius: 10px;
-    padding: 24px;
-    margin-bottom: 16px;
-    transition: border-color 0.2s;
-  }
-  .report-card:hover { border-color: #333; }
-  .report-card h3 {
-    font-size: 16px;
-    color: #e0e0e0;
-    margin-bottom: 8px;
-  }
-  .report-card .summary {
-    color: #999;
-    font-size: 14px;
-    line-height: 1.6;
-    margin-bottom: 12px;
-  }
-  .report-card .meta {
-    font-size: 12px;
-    color: #555;
-  }
-  .report-card .findings {
-    margin-top: 12px;
-    padding-top: 12px;
-    border-top: 1px solid #1a1a2e;
-  }
-  .finding {
-    background: rgba(139, 92, 246, 0.06);
-    border-left: 3px solid #8b5cf6;
-    padding: 10px 14px;
-    margin-bottom: 8px;
-    border-radius: 0 6px 6px 0;
-    font-size: 13px;
-    color: #ccc;
-    line-height: 1.5;
-  }
-  .empty {
-    text-align: center;
-    color: #555;
-    padding: 48px;
-    font-size: 15px;
-  }
-</style>
-</head>
-<body>
+  return (
+    <div className="card" style={{padding: '20px'}}>
+      <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px'}}>
+        <div style={{fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px',
+          color: '#8b5cf6', fontWeight: 600}}>Run Investigation</div>
+        <span style={{fontSize: '11px', color: '#555'}}>Agent Swarm</span>
+      </div>
 
-<nav>
-  <span class="brand">E-FINDER</span>
-  <div class="links">
-    <a href="/">Dashboard</a>
-    <a href="/network">Relationship Map</a>
-    <a href="/reports" class="active">Reports</a>
-  </div>
-</nav>
+      <div style={{display: 'flex', gap: '8px', marginBottom: '12px'}}>
+        <input type="text" value={query} onChange={e => setQuery(e.target.value)}
+          placeholder="Ask a question about the corpus..."
+          onKeyDown={e => e.key === 'Enter' && handleRun(query)}
+          style={{flex: 1, background: '#0a0a12', border: '1px solid #333', borderRadius: '8px',
+            padding: '8px 12px', fontSize: '13px', color: '#e0e0e0', outline: 'none'}} />
+        <button onClick={() => handleRun(query)} disabled={!query || running}
+          style={{padding: '8px 16px', background: running ? '#333' : '#8b5cf6',
+            color: running ? '#888' : '#fff', border: 'none', borderRadius: '8px',
+            fontSize: '13px', fontWeight: 500, cursor: running ? 'default' : 'pointer'}}>
+          {running ? 'Running...' : 'Investigate'}
+        </button>
+      </div>
 
-<div class="page">
-  <div class="content">
-    <h1>Investigation Reports</h1>
-    <p class="subtitle">AI-generated analysis from the OSINT agent swarm</p>
-    <div id="reports-list"><div class="empty">Loading reports...</div></div>
-  </div>
-</div>
+      <div style={{marginBottom: '12px'}}>
+        {presets.map((p, i) => (
+          <button key={i} onClick={() => { setQuery(p); handleRun(p); }}
+            disabled={running}
+            style={{display: 'block', width: '100%', textAlign: 'left', fontSize: '12px',
+              color: '#666', background: 'none', border: 'none', padding: '5px 8px',
+              borderRadius: '4px', cursor: running ? 'default' : 'pointer',
+              opacity: running ? 0.4 : 1}}>
+            {p}
+          </button>
+        ))}
+      </div>
 
-<script>
-fetch('/api/reports')
-  .then(r => r.json())
-  .then(reports => {
-    const container = document.getElementById('reports-list');
-    if (!reports.length) {
-      container.innerHTML = '<div class="empty">No investigation reports yet. Run the swarm to generate reports.</div>';
-      return;
-    }
-    container.innerHTML = '';
-    reports.forEach(r => {
-      const findings = (r.key_findings || []).map(f =>
-        '<div class="finding">' + escapeHtml(typeof f === 'string' ? f : f.finding || JSON.stringify(f)) + '</div>'
-      ).join('');
+      {running && (
+        <div style={{border: '1px solid rgba(139,92,246,0.3)', background: 'rgba(139,92,246,0.05)',
+          borderRadius: '8px', padding: '12px'}}>
+          <div style={{display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px'}}>
+            <div style={{width: '8px', height: '8px', background: '#8b5cf6', borderRadius: '50%',
+              animation: 'pulse 1.5s infinite'}}></div>
+            <span style={{fontSize: '12px', color: '#a78bfa'}}>
+              Swarm active — agents working ({elapsed}s)
+            </span>
+          </div>
+          <div style={{fontSize: '11px', color: '#666', lineHeight: '1.6'}}>
+            <div>NetworkMapper: building co-occurrence graph...</div>
+            <div>DocumentQuery: searching corpus...</div>
+            <div>TimelineBuilder: extracting events...</div>
+            <div>Coordinator: synthesizing findings...</div>
+          </div>
+        </div>
+      )}
 
-      const meta = r.meta || {};
-      const date = r.timestamp ? new Date(r.timestamp).toLocaleDateString() : 'Unknown date';
-      const cost = meta.estimated_cost ? '$' + meta.estimated_cost.toFixed(3) : '';
-      const duration = meta.total_duration_seconds ? meta.total_duration_seconds.toFixed(1) + 's' : '';
+      {error && (
+        <div style={{border: '1px solid #ef4444', background: 'rgba(239,68,68,0.05)',
+          borderRadius: '8px', padding: '12px', fontSize: '13px', color: '#f87171'}}>
+          Error: {error}
+        </div>
+      )}
 
-      container.innerHTML += `
-        <div class="report-card">
-          <h3>${escapeHtml(r.question || 'Investigation')}</h3>
-          <div class="summary">${escapeHtml(r.executive_summary || '')}</div>
-          <div class="meta">${date} ${duration ? '&middot; ' + duration : ''} ${cost ? '&middot; ' + cost : ''}</div>
-          ${findings ? '<div class="findings">' + findings + '</div>' : ''}
-        </div>`;
-    });
-  });
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
+      {result && (
+        <div style={{border: '1px solid #1a1a2e', borderRadius: '8px', padding: '16px', marginTop: '8px'}}>
+          <div style={{fontSize: '14px', fontWeight: 600, color: '#fff', marginBottom: '8px'}}>
+            {result.question}
+          </div>
+          <div style={{fontSize: '13px', color: '#aaa', lineHeight: '1.6', marginBottom: '12px'}}>
+            {result.executive_summary}
+          </div>
+          {result.key_findings?.length > 0 && (
+            <div style={{borderTop: '1px solid #1a1a2e', paddingTop: '12px'}}>
+              <div style={{fontSize: '11px', textTransform: 'uppercase', color: '#8b5cf6',
+                marginBottom: '8px', fontWeight: 600}}>Key Findings</div>
+              {result.key_findings.map((f, i) => (
+                <div key={i} className="finding-card"
+                  style={{padding: '10px 14px', marginBottom: '6px', borderRadius: '0 6px 6px 0',
+                    fontSize: '12px', color: '#ccc', lineHeight: '1.5'}}>
+                  {typeof f === 'string' ? f : f.finding || JSON.stringify(f)}
+                </div>
+              ))}
+            </div>
+          )}
+          {result.meta && (
+            <div style={{marginTop: '8px', fontSize: '11px', color: '#555'}}>
+              {result.meta.total_duration_seconds ? result.meta.total_duration_seconds.toFixed(1) + 's' : ''}
+              {result.meta.estimated_cost ? ' | $' + result.meta.estimated_cost.toFixed(3) : ''}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
+
+// ─── Overview Page ───
+function OverviewPage({ onNavigate }) {
+  const { data: stats } = useFetch('/api/stats');
+  const { data: topPeople } = useFetch('/api/top-entities?type=person&limit=12');
+  const { data: breakdown } = useFetch('/api/entity-breakdown');
+  const { data: reports } = useFetch('/api/reports');
+
+  const maxCount = topPeople?.[0]?.count || 1;
+
+  // API now returns type classification for each person
+  const latestReport = reports?.[0];
+
+  return (
+    <div style={{maxWidth: '1200px', margin: '0 auto', padding: '32px 24px'}}>
+      {/* Stats row */}
+      <div style={{display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px', marginBottom: '32px'}}>
+        <StatCard label="Documents Analyzed" value={stats?.extracted_docs} icon="&#128196;" />
+        <StatCard label="Entities Extracted" value={stats?.total_entities} icon="&#127991;" />
+        <StatCard label="Network Connections" value={stats?.network_edges} icon="&#128279;" />
+        <StatCard label="Investigations Run" value={stats?.reports} icon="&#128270;" />
+      </div>
+
+      <div style={{display: 'grid', gridTemplateColumns: '3fr 2fr', gap: '24px'}}>
+        {/* Left column */}
+        <div>
+          {/* Network preview card */}
+          <div className="card" style={{padding: '20px', marginBottom: '24px'}}>
+            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px'}}>
+              <div style={{fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px',
+                color: '#8b5cf6', fontWeight: 600}}>Relationship Map</div>
+              <button onClick={() => onNavigate('network')}
+                style={{fontSize: '12px', color: '#666', background: 'none', border: 'none',
+                  cursor: 'pointer'}}>Open Full Map →</button>
+            </div>
+            <div style={{background: '#050508', borderRadius: '8px', padding: '24px', textAlign: 'center'}}>
+              <div style={{fontSize: '48px', marginBottom: '8px', opacity: 0.5}}>&#128376;</div>
+              <div style={{color: '#888', fontSize: '14px'}}>
+                {stats ? `${(stats.network_edges || 0).toLocaleString()} connections between ${(stats.total_entities || 0).toLocaleString()} entities` : 'Loading...'}
+              </div>
+              <button onClick={() => onNavigate('network')}
+                style={{marginTop: '12px', padding: '8px 20px', background: '#8b5cf6', color: '#fff',
+                  border: 'none', borderRadius: '6px', fontSize: '13px', fontWeight: 500, cursor: 'pointer'}}>
+                Explore Network
+              </button>
+            </div>
+            <div style={{display: 'flex', gap: '16px', marginTop: '12px', flexWrap: 'wrap'}}>
+              {Object.entries(TYPE_COLORS).map(([type, color]) => (
+                <div key={type} style={{display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: '#666'}}>
+                  <div style={{width: '8px', height: '8px', borderRadius: '50%', background: color}}></div>
+                  <span style={{textTransform: 'capitalize'}}>{type.replace('_', ' ')}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Investigation panel */}
+          <InvestigationPanel />
+        </div>
+
+        {/* Right column */}
+        <div>
+          {/* Top people */}
+          <div className="card" style={{padding: '20px', marginBottom: '24px'}}>
+            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px'}}>
+              <div style={{fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px',
+                color: '#8b5cf6', fontWeight: 600}}>Most Referenced People</div>
+              <button onClick={() => onNavigate('entities')}
+                style={{fontSize: '12px', color: '#666', background: 'none', border: 'none',
+                  cursor: 'pointer'}}>View All →</button>
+            </div>
+            {topPeople?.slice(0, 10).map((p, i) => (
+              <EntityBar key={i} name={p.name} count={p.count} maxCount={maxCount} type={p.type || 'other'} />
+            ))}
+          </div>
+
+          {/* Entity breakdown */}
+          <div className="card" style={{padding: '20px', marginBottom: '24px'}}>
+            <div style={{fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px',
+              color: '#8b5cf6', fontWeight: 600, marginBottom: '16px'}}>Entity Breakdown</div>
+            {breakdown?.map((e, i) => (
+              <div key={i} style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px'}}>
+                <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                  <div style={{width: '10px', height: '10px', borderRadius: '4px',
+                    background: ENTITY_COLORS[e.type] || '#6b7280'}}></div>
+                  <span style={{fontSize: '12px', color: '#aaa', textTransform: 'capitalize'}}>
+                    {(e.type || '').replace('_', ' ')}
+                  </span>
+                </div>
+                <span style={{fontSize: '12px', color: '#666'}}>{e.count.toLocaleString()}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Latest report */}
+          {latestReport && (
+            <div className="card" style={{padding: '20px'}}>
+              <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px'}}>
+                <div style={{fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px',
+                  color: '#8b5cf6', fontWeight: 600}}>Latest Report</div>
+                <button onClick={() => onNavigate('reports')}
+                  style={{fontSize: '12px', color: '#666', background: 'none', border: 'none',
+                    cursor: 'pointer'}}>All Reports →</button>
+              </div>
+              <div style={{fontSize: '13px', fontWeight: 500, color: '#ddd', marginBottom: '6px'}}>
+                {latestReport.question}
+              </div>
+              <div style={{fontSize: '12px', color: '#777', lineHeight: '1.5'}}>
+                {(latestReport.executive_summary || '').slice(0, 150)}...
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Reports Page ───
+function ReportsPage() {
+  const { data: reports, loading } = useFetch('/api/reports');
+  const [expanded, setExpanded] = useState(null);
+
+  return (
+    <div style={{maxWidth: '800px', margin: '0 auto', padding: '32px 24px'}}>
+      <h2 style={{fontSize: '20px', fontWeight: 600, color: '#fff', marginBottom: '8px'}}>
+        Investigation Reports</h2>
+      <p style={{fontSize: '14px', color: '#666', marginBottom: '24px'}}>
+        AI-generated analysis from the agent swarm</p>
+
+      {loading && <div style={{color: '#666', textAlign: 'center', padding: '40px'}}>Loading...</div>}
+      {reports && !reports.length && (
+        <div style={{color: '#555', textAlign: 'center', padding: '48px', fontSize: '14px'}}>
+          No investigation reports yet. Run the swarm to generate reports.</div>
+      )}
+      {reports?.map((r, i) => {
+        const meta = r.meta || {};
+        const date = r.timestamp ? new Date(r.timestamp).toLocaleDateString() : '';
+        const cost = meta.estimated_cost ? '$' + meta.estimated_cost.toFixed(3) : '';
+        const duration = meta.total_duration_seconds ? meta.total_duration_seconds.toFixed(1) + 's' : '';
+        const isExpanded = expanded === i;
+        const findings = r.key_findings || [];
+
+        return (
+          <div key={i} className="card" style={{padding: '20px', marginBottom: '12px', cursor: 'pointer'}}
+            onClick={() => setExpanded(isExpanded ? null : i)}>
+            <div style={{fontSize: '14px', fontWeight: 500, color: '#e0e0e0', marginBottom: '8px'}}>
+              {r.question || 'Investigation'}</div>
+            <div style={{fontSize: '13px', color: '#888', lineHeight: '1.6', marginBottom: '10px'}}>
+              {r.executive_summary || ''}</div>
+            <div style={{display: 'flex', gap: '16px', fontSize: '12px', color: '#555'}}>
+              <span>{findings.length} findings</span>
+              {duration && <span>{duration}</span>}
+              {cost && <span>{cost}</span>}
+              {date && <span>{date}</span>}
+            </div>
+            {isExpanded && findings.length > 0 && (
+              <div style={{marginTop: '12px', paddingTop: '12px', borderTop: '1px solid #1a1a2e'}}>
+                {findings.map((f, j) => (
+                  <div key={j} className="finding-card"
+                    style={{padding: '10px 14px', marginBottom: '8px', borderRadius: '0 6px 6px 0',
+                      fontSize: '13px', color: '#ccc', lineHeight: '1.5'}}>
+                    {typeof f === 'string' ? f : f.finding || JSON.stringify(f)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Entities Page ───
+function EntitiesPage() {
+  const { data: people } = useFetch('/api/top-entities?type=person&limit=50');
+  const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState('All');
+
+  const filtered = people?.filter(p => {
+    const matchesSearch = !search || p.name.toLowerCase().includes(search.toLowerCase());
+    const matchesType = typeFilter === 'All' || (p.type || 'other') === typeFilter.toLowerCase().replace(' ', '_');
+    return matchesSearch && matchesType;
+  }) || [];
+
+  return (
+    <div style={{maxWidth: '1000px', margin: '0 auto', padding: '32px 24px'}}>
+      <h2 style={{fontSize: '20px', fontWeight: 600, color: '#fff', marginBottom: '8px'}}>Entity Explorer</h2>
+      <p style={{fontSize: '14px', color: '#666', marginBottom: '24px'}}>
+        Browse extracted entities across the corpus</p>
+
+      <div style={{display: 'flex', gap: '8px', marginBottom: '24px', alignItems: 'center'}}>
+        {['All', 'Defendant', 'Legal', 'Victim', 'Law Enforcement', 'Witness', 'Other'].map(f => (
+          <button key={f} onClick={() => setTypeFilter(f)}
+            style={{padding: '6px 12px', fontSize: '12px', fontWeight: 500, borderRadius: '6px',
+              background: typeFilter === f ? 'rgba(139,92,246,0.2)' : '#111',
+              color: typeFilter === f ? '#a78bfa' : '#888',
+              border: `1px solid ${typeFilter === f ? '#8b5cf6' : '#222'}`, cursor: 'pointer'}}>
+            {f}
+          </button>
+        ))}
+        <input type="text" placeholder="Search entities..." value={search}
+          onChange={e => setSearch(e.target.value)}
+          style={{marginLeft: 'auto', background: '#111', border: '1px solid #333', borderRadius: '6px',
+            padding: '6px 12px', fontSize: '12px', color: '#e0e0e0', width: '250px', outline: 'none'}} />
+      </div>
+
+      <div className="card" style={{overflow: 'hidden'}}>
+        <table style={{width: '100%', fontSize: '12px', borderCollapse: 'collapse'}}>
+          <thead>
+            <tr style={{borderBottom: '1px solid #1a1a2e'}}>
+              <th style={{textAlign: 'left', padding: '12px', color: '#666', fontWeight: 500}}>Name</th>
+              <th style={{textAlign: 'left', padding: '12px', color: '#666', fontWeight: 500}}>Role</th>
+              <th style={{textAlign: 'right', padding: '12px', color: '#666', fontWeight: 500}}>Documents</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((p, i) => (
+              <tr key={i} style={{borderBottom: '1px solid #0f0f1a'}}>
+                <td style={{padding: '10px 12px', color: '#ddd', fontWeight: 500}}>
+                  <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                    <div style={{width: '8px', height: '8px', borderRadius: '50%',
+                      background: TYPE_COLORS[p.type] || TYPE_COLORS.other, flexShrink: 0}}></div>
+                    {p.name}
+                  </div>
+                </td>
+                <td style={{padding: '10px 12px', color: '#888', textTransform: 'capitalize', fontSize: '11px'}}>
+                  {(p.type || 'other').replace('_', ' ')}
+                </td>
+                <td style={{padding: '10px 12px', color: '#888', textAlign: 'right'}}>{p.count.toLocaleString()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── App Shell ───
+function App() {
+  const [tab, setTab] = useState('overview');
+  const tabs = [
+    {id: 'overview', label: 'Overview'},
+    {id: 'network', label: 'Relationship Map'},
+    {id: 'reports', label: 'Reports'},
+    {id: 'entities', label: 'Entities'},
+  ];
+
+  return (
+    <div style={{minHeight: '100vh'}}>
+      {/* Nav */}
+      <nav style={{position: 'fixed', top: 0, left: 0, right: 0, zIndex: 1000,
+        background: 'rgba(10,10,15,0.95)', backdropFilter: 'blur(12px)',
+        borderBottom: '1px solid #1a1a2e', padding: '0 24px',
+        display: 'flex', alignItems: 'center', height: '48px'}}>
+        <span className="brand" style={{marginRight: '32px'}}>E-FINDER</span>
+        <div style={{display: 'flex', gap: '4px'}}>
+          {tabs.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              className={tab === t.id ? 'tab-active' : 'tab-inactive'}
+              style={{padding: '6px 12px', fontSize: '12px', fontWeight: 500,
+                borderRadius: '6px', border: 'none', cursor: 'pointer', background: tab === t.id ? 'rgba(255,255,255,0.08)' : 'transparent'}}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <div style={{marginLeft: 'auto', fontSize: '12px', color: '#555'}}>
+          DOJ Epstein Document Corpus
+        </div>
+      </nav>
+
+      <div style={{paddingTop: '48px'}}>
+        {tab === 'overview' && <OverviewPage onNavigate={setTab} />}
+        {tab === 'network' && <NetworkMap />}
+        {tab === 'reports' && <ReportsPage />}
+        {tab === 'entities' && <EntitiesPage />}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(<App />, document.getElementById('root'));
 </script>
 </body>
 </html>"""
@@ -1001,15 +1034,15 @@ if __name__ == "__main__":
         docs = db["documents"].count_documents({})
         print(f"  Connected. {docs:,} documents in corpus.\n")
     except Exception as e:
-        print(f"  ⚠ MongoDB connection failed: {e}")
+        print(f"  Warning: MongoDB connection failed: {e}")
         print(f"  Dashboard will retry on each request.\n")
         _db = None
 
-    print(f"  Starting Flask on port {PORT}...")
+    print(f"  Starting on port {PORT}...")
     print(f"  Local:  http://localhost:{PORT}")
-    print(f"  ")
+    print(f"")
     print(f"  To share publicly, run in another tmux pane:")
-    print(f"  cloudflared tunnel --url http://localhost:{PORT}")
+    print(f"  ~/efinder/cloudflared tunnel --url http://localhost:{PORT}")
     print(f"{'='*60}\n")
 
     app.run(host="0.0.0.0", port=PORT, debug=False)
