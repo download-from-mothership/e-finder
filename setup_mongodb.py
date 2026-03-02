@@ -37,7 +37,7 @@ except ImportError:
 
 MONGODB_URI = os.environ.get(
     "MONGODB_URI",
-    "mongodb+srv://efinder-db:<db_password>@e-cluster0.ulpu7g.mongodb.net/?retryWrites=true&w=majority&appName=e-Cluster0",
+    "mongodb+srv://user:password@your-cluster.mongodb.net/?retryWrites=true&w=majority",
 )
 
 DATABASE_NAME = "doj_investigation"

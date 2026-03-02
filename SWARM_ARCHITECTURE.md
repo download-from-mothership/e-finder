@@ -287,7 +287,7 @@ reports:            question (text), created_at
 |-----------|-----------|-----|
 | Agent runtime | Python 3.12 | Already deployed on VPS |
 | LLM | Claude Sonnet 4.5 | Best cost/quality for structured extraction |
-| Database | MongoDB Atlas | Already set up with 26K docs |
+| Database | MongoDB Atlas | See `.env` for connection details |
 | Graph analysis | NetworkX | Lightweight, pure Python, excellent algorithms |
 | Web scraping (OSINT) | httpx + BeautifulSoup | Async, handles rate limiting |
 | Orchestration | Custom Python coordinator | Simple, no extra infrastructure |

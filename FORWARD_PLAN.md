@@ -11,17 +11,17 @@
 
 - **26,140 PDFs downloaded** across 52 sections (12 Data Sets + 34 court cases + 4 FOIA + 2 prior disclosures)
 - **Integrity verified** — zero invalid headers, zero duplicates by SHA-256 hash
-- **MongoDB Atlas** set up — cluster `e-cluster0.ulpu7g.mongodb.net`, database `doj_investigation`
+- **MongoDB Atlas** set up — connection configured via `MONGODB_URI` env var (see `.env`)
 - **26,138 documents ingested** into `documents` collection with metadata (page counts, hashes, sections)
 - **Entity extraction pipeline** tested on 50 docs (48/50 successful), upgraded with entity ingestion + progress logging
-- **Full extraction running** on Hetzner VPS (`~/efinder/`) — 26K docs via Claude Sonnet, ~6-7 day ETA, ~$150 API cost
+- **Full extraction running** on Hetzner VPS — 26K docs via Claude Sonnet, ~6-7 day ETA, ~$150 API cost
 - **Swarm architecture designed** — see `SWARM_ARCHITECTURE.md`
 - **Entity resolver built** — fuzzy + exact deduplication, optional Claude disambiguation
 - **Swarm coordinator + 4 agents** built — network mapper, document query, timeline builder, redaction analyst
 
 ### In Progress
 
-- **VPS entity extraction** — running in tmux session `efinder`, monitor via `tail -f ~/efinder/_pipeline_output/extraction_progress.log`
+- **VPS entity extraction** — running in tmux session `efinder`, monitor via `tail -f extraction_progress.log`
 
 ---
 
@@ -29,13 +29,13 @@
 
 | Component | Location | Details |
 |-----------|----------|---------|
-| PDF Library | VPS: `~/efinder/doj_full_library/` | 26,140 files, 16GB |
-| PDF Library (backup) | Mac: ProtonDrive `E-FINDER/doj_full_library/` | Same files |
-| MongoDB Atlas | `e-cluster0.ulpu7g.mongodb.net` | User: `efinder-db`, DB: `doj_investigation` |
-| Extraction pipeline | VPS: `~/efinder/_pipeline_output/extract_entities.py` | Running in tmux |
-| Swarm scripts | Mac: `E-FINDER/_pipeline_output/` | Ready to deploy |
-| VPS (Hetzner) | `100.107.109.53` (Tailscale) | CPX22, Ubuntu 24.04 |
-| E-FINDER workspace | VPS: `~/efinder/` (separate from OpenClaw) | Own venv + .env |
+| PDF Library | VPS: `doj_full_library/` | 26,140 files, 16GB |
+| PDF Library (backup) | Mac: ProtonDrive backup | Same files |
+| MongoDB Atlas | See `.env` | Set via `MONGODB_URI` env var |
+| Extraction pipeline | VPS: `extract_entities.py` | Running in tmux |
+| Swarm scripts | Mac: local workspace | Ready to deploy |
+| VPS (Hetzner) | See `.env` | Access via Tailscale |
+| E-FINDER workspace | VPS: own venv + `.env` | Separate from other projects |
 
 ---
 

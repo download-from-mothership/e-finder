@@ -4,7 +4,7 @@ Quick swarm test — runs each agent on the currently extracted docs.
 Run this on the VPS after the extraction has some data.
 
 Usage:
-  cd ~/efinder
+  cd ~/efinder  # adjust to your workspace path
   source .venv/bin/activate
   export $(cat .env | xargs)
   python3 _pipeline_output/test_swarm.py

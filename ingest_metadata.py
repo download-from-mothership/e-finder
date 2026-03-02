@@ -9,7 +9,7 @@ Each document gets: filename, section, file_size, sha256, page_count, doc_id.
 PageIndex trees and entity extraction are added later in Phase B.
 
 Usage:
-  export MONGODB_URI="mongodb+srv://efinder-db:PASSWORD@e-cluster0.ulpu7g.mongodb.net/?retryWrites=true&w=majority&appName=e-Cluster0"
+  export MONGODB_URI="mongodb+srv://user:PASSWORD@your-cluster.mongodb.net/?retryWrites=true&w=majority"
   python3 _pipeline_output/ingest_metadata.py
 
 Options:
@@ -68,7 +68,7 @@ log = logging.getLogger(__name__)
 
 MONGODB_URI = os.environ.get(
     "MONGODB_URI",
-    "mongodb+srv://efinder-db:<db_password>@e-cluster0.ulpu7g.mongodb.net/?retryWrites=true&w=majority&appName=e-Cluster0",
+    "mongodb+srv://user:password@your-cluster.mongodb.net/?retryWrites=true&w=majority",
 )
 DATABASE_NAME = "doj_investigation"
 
@@ -179,7 +179,7 @@ def main():
     # Connect to MongoDB
     if "<db_password>" in MONGODB_URI:
         print("  ERROR: Set MONGODB_URI environment variable with your password.")
-        print('  export MONGODB_URI="mongodb+srv://efinder-db:PASSWORD@e-cluster0.ulpu7g.mongodb.net/..."')
+        print('  export MONGODB_URI="mongodb+srv://user:PASSWORD@your-cluster.mongodb.net/..."')
         sys.exit(1)
 
     print("  Connecting to MongoDB...")

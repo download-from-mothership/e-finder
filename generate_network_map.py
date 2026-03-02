@@ -12,7 +12,7 @@ Usage:
   python3 _pipeline_output/generate_network_map.py
 
   # Then copy to Mac:
-  # scp openclaw@100.107.109.53:~/efinder/entity_relationship_map.html ~/Desktop/
+  # scp user@your-vps:~/efinder/entity_relationship_map.html ~/Desktop/
 """
 
 import json

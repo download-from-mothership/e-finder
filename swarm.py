@@ -8,7 +8,7 @@ The coordinator takes a research question, routes it to specialist agents,
 collects their findings, and synthesizes a report.
 
 Usage:
-  export MONGODB_URI="mongodb+srv://efinder-db:PASSWORD@e-cluster0.ulpu7g.mongodb.net/..."
+  export MONGODB_URI="mongodb+srv://user:PASSWORD@your-cluster.mongodb.net/..."
   export ANTHROPIC_API_KEY="sk-ant-..."
 
   # Interactive mode — ask questions
@@ -57,7 +57,7 @@ log = logging.getLogger(__name__)
 
 MONGODB_URI = os.environ.get(
     "MONGODB_URI",
-    "mongodb+srv://efinder-db:<db_password>@e-cluster0.ulpu7g.mongodb.net/?retryWrites=true&w=majority&appName=e-Cluster0",
+    "mongodb+srv://user:password@your-cluster.mongodb.net/?retryWrites=true&w=majority",
 )
 DATABASE_NAME = "doj_investigation"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")

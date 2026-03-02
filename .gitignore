@@ -14,6 +14,7 @@ __pycache__/
 !package.json
 download.log
 extraction_progress.log
+*.log
 
 # Generated outputs
 entity_relationship_map.html
