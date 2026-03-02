@@ -1,0 +1,25 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Large data files (not code)
+*.json
+!package.json
+download.log
+extraction_progress.log
+
+# Generated outputs
+entity_relationship_map.html
+serve/
+pageindex_trees/
+
+# IDE
+.vscode/
+.idea/
