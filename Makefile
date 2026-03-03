@@ -58,40 +58,42 @@ ps:
 	docker compose ps
 
 # ── Migration ─────────────────────────────────────────────────────────────────
+# The entrypoint reads the first arg as the MODE (migrate), then passes the
+# remaining args through to weaviate_setup.py.
 migrate-test:
-	docker compose run --rm migrate --setup
-	docker compose run --rm migrate --migrate --limit 100
-	docker compose run --rm migrate --stats
+	docker compose run --rm migrate migrate --setup
+	docker compose run --rm migrate migrate --migrate --limit 100
+	docker compose run --rm migrate migrate --stats
 
 migrate:
-	docker compose run --rm migrate --setup
-	docker compose run --rm migrate --migrate
-	docker compose run --rm migrate --stats
+	docker compose run --rm migrate migrate --setup
+	docker compose run --rm migrate migrate --migrate
+	docker compose run --rm migrate migrate --stats
 
 # ── GLiNER ────────────────────────────────────────────────────────────────────
 gliner-test:
-	docker compose run --rm gliner --limit 500
+	docker compose run --rm gliner gliner --limit 500
 
 gliner:
-	docker compose run --rm gliner --update-weaviate
-	docker compose run --rm gliner --stats
+	docker compose run --rm gliner gliner --update-weaviate
+	docker compose run --rm gliner gliner --stats
 
 # ── Entity extraction ─────────────────────────────────────────────────────────
 extract-test:
-	docker compose run --rm extract --limit 50
+	docker compose run --rm extract extract --limit 50
 
 extract:
-	docker compose run --rm extract --resume
+	docker compose run --rm extract extract --resume
 
 # ── Swarm ─────────────────────────────────────────────────────────────────────
 network-map:
-	docker compose run --rm swarm --agent network_mapper
+	docker compose run --rm swarm swarm --agent network_mapper
 
 swarm:
 ifndef Q
 	$(error Q is not set. Usage: make swarm Q="your question here")
 endif
-	docker compose run --rm swarm -q "$(Q)"
+	docker compose run --rm swarm swarm -q "$(Q)"
 
 # ── Debug ─────────────────────────────────────────────────────────────────────
 shell:
