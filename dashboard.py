@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -51,6 +52,18 @@ MIN_EDGE_WEIGHT = 2
 app = Flask(__name__)
 
 _db = None
+
+# ─── Simple TTL cache ────────────────────────────────────────────────
+_cache = {}  # key -> (value, expires_at)
+
+def _cache_get(key):
+    entry = _cache.get(key)
+    if entry and time.time() < entry[1]:
+        return entry[0]
+    return None
+
+def _cache_set(key, value, ttl=600):
+    _cache[key] = (value, time.time() + ttl)
 
 def get_db():
     global _db
@@ -88,22 +101,31 @@ def _classify_person_role(db, name):
 
 @app.route("/api/stats")
 def api_stats():
+    cached = _cache_get("stats")
+    if cached:
+        return jsonify(cached)
     db = get_db()
-    return jsonify({
+    result = {
         "total_docs": db["documents"].count_documents({}),
         "extracted_docs": db["documents"].count_documents({"processing_stage": "entities_extracted"}),
         "total_entities": db["entities"].count_documents({}),
         "network_edges": db["network"].count_documents({}),
         "reports": db["reports"].count_documents({}),
         "generated_at": datetime.utcnow().isoformat() + "Z",
-    })
+    }
+    _cache_set("stats", result, ttl=120)  # cache for 2 minutes
+    return jsonify(result)
 
 
 @app.route("/api/network")
 def api_network():
-    db = get_db()
     min_weight = int(request.args.get("min_weight", MIN_EDGE_WEIGHT))
     max_nodes = int(request.args.get("max_nodes", MAX_NODES))
+    cache_key = f"network_{min_weight}_{max_nodes}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return jsonify(cached)
+    db = get_db()
 
     edges_raw = list(db["network"].find(
         {"weight": {"$gte": min_weight}},
@@ -154,7 +176,9 @@ def api_network():
             "type": node_type,
         })
 
-    return jsonify({"nodes": nodes, "edges": edges})
+    result = {"nodes": nodes, "edges": edges}
+    _cache_set(cache_key, result, ttl=600)  # cache for 10 minutes
+    return jsonify(result)
 
 
 @app.route("/api/reports")
