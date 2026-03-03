@@ -1,0 +1,27 @@
+# ── E-FINDER — Python dependencies ───────────────────────────────────────────
+# Core
+anthropic>=0.25.0
+pymongo[srv]>=4.6.0
+flask>=3.0.0
+gunicorn>=22.0.0
+
+# PDF extraction
+PyMuPDF>=1.24.0
+
+# Weaviate (IntellYWeave integration)
+weaviate-client>=4.5.0
+
+# NLP / NER (GLiNER integration)
+gliner>=0.2.0
+torch>=2.2.0
+transformers>=4.40.0
+
+# Network analysis
+networkx>=3.3
+
+# Geospatial / HTTP
+requests>=2.31.0
+
+# Utilities
+python-dotenv>=1.0.0
+tqdm>=4.66.0

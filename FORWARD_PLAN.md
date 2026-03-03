@@ -1,7 +1,7 @@
 # DOJ Epstein Document Analysis Pipeline — Forward Plan
 
 **Last updated:** March 2, 2026
-**Status:** Phase 3 complete. Phase 4 (swarm) complete. **IntellYWeave integration complete (Phase 5).**
+**Status:** Phase 3 complete. Phase 4 (swarm) complete. Phase 5 (IntellYWeave) complete. **Phase 6 (Docker deployment) complete.**
 
 ---
 
@@ -32,8 +32,9 @@
 | PDF Library | VPS: `doj_full_library/` | 26,140 files, 16GB |
 | PDF Library (backup) | Mac: ProtonDrive backup | Same files |
 | MongoDB Atlas | See `.env` | Set via `MONGODB_URI` env var |
-| Extraction pipeline | VPS: `extract_entities.py` | Running in tmux |
-| Swarm scripts | Mac: local workspace | Ready to deploy |
+| Weaviate | Docker: `efinder-weaviate` | Vector DB, port 8080, data in `weaviate_data` volume |
+| Dashboard | Docker: `efinder-dashboard` | Flask + React UI, port 5000 |
+| Swarm / pipeline tools | Docker: one-shot containers | `make swarm`, `make extract`, etc. |
 | VPS (Hetzner) | See `.env` | Access via Tailscale |
 | E-FINDER workspace | VPS: own venv + `.env` | Separate from other projects |
 
@@ -164,54 +165,106 @@ python3 _pipeline_output/swarm.py --agent document_query -q "Find all financial 
 
 ---
 
-## Phase 5: IntellYWeave Integration — Setup Steps
+## Phase 6: Docker Deployment
 
-Run these **after** entity extraction completes, in order:
+The entire stack is now containerised. No virtual environments, no manual pip installs.
 
-### Step 1 — Start Weaviate (Docker required)
+### New files
+| File | Purpose |
+|------|--------|
+| `Dockerfile` | Python 3.11 image for all e-finder services |
+| `docker-compose.yml` | Orchestrates Weaviate + dashboard + one-shot tool containers |
+| `.env.example` | Template for secrets — copy to `.env` and fill in |
+| `.dockerignore` | Keeps the image lean (excludes PDFs, logs, caches) |
+| `requirements.txt` | All Python dependencies |
+| `Makefile` | Shorthand `make` commands |
+| `docker/entrypoint.sh` | Routes container CMD to the correct Python script |
+
+### Quick start
 ```bash
-docker run -d -p 8080:8080 -p 50051:50051 \
-  -e AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
-  -e PERSISTENCE_DATA_PATH=/var/lib/weaviate \
-  -v weaviate_data:/var/lib/weaviate \
-  cr.weaviate.io/semitechnologies/weaviate:latest
+# 1. Clone the repo and enter it
+git clone https://github.com/download-from-mothership/e-finder.git
+cd e-finder
+
+# 2. Set up secrets
+cp .env.example .env
+# Edit .env — fill in MONGODB_URI, ANTHROPIC_API_KEY, OPENAI_API_KEY
+# Optionally set PDF_LIBRARY_PATH to your local PDF library path
+
+# 3. Start Weaviate + dashboard
+make up
+# → Dashboard: http://localhost:5000
+# → Weaviate:  http://localhost:8080
+
+# 4. Migrate corpus to Weaviate (first time only)
+make migrate-test    # test with 100 docs first
+make migrate         # full 26K migration
+
+# 5. Run GLiNER extraction pass (first time only)
+make gliner-test     # test with 500 docs
+make gliner          # full corpus
+
+# 6. Build the network map
+make network-map
+
+# 7. Run an investigation
+make swarm Q="Who are the most connected people in the corpus?"
 ```
 
-### Step 2 — Migrate MongoDB → Weaviate
+### All available commands
 ```bash
-export OPENAI_API_KEY="sk-..."
-export WEAVIATE_URL="http://localhost:8080"
-python3 weaviate_setup.py --setup           # Create schema
-python3 weaviate_setup.py --migrate --limit 100  # Test with 100 docs
-python3 weaviate_setup.py --migrate         # Full migration (26K docs)
-python3 weaviate_setup.py --stats           # Verify
+make up              # Start Weaviate + dashboard (detached)
+make down            # Stop all services
+make build           # Rebuild the app image
+make logs            # Tail all service logs
+make ps              # Show running containers
+
+make migrate-test    # Migrate 100 docs → Weaviate (test)
+make migrate         # Migrate full corpus → Weaviate
+
+make gliner-test     # GLiNER NER pass on 500 docs (test)
+make gliner          # GLiNER NER pass on full corpus
+
+make extract-test    # Extract entities from 50 docs (test)
+make extract         # Extract entities (resume from last position)
+
+make network-map     # Build co-occurrence network in MongoDB
+make swarm Q="..."   # Run a swarm investigation question
+make shell           # Open a bash shell inside the app container
+make clean           # Remove volumes and containers
 ```
 
-### Step 3 — Run GLiNER extraction
+### Running without Make
 ```bash
-pip install gliner
-python3 gliner_reextract.py --dry-run --limit 5   # Preview
-python3 gliner_reextract.py --limit 500           # Test batch
-python3 gliner_reextract.py --update-weaviate     # Full run + update Weaviate
-python3 gliner_reextract.py --stats               # Show cryptonyms/laws/events found
+# Start everything
+docker compose up -d
+
+# Run a swarm question
+docker compose run --rm swarm -q "What financial connections appear between Epstein and Deutsche Bank?"
+
+# Run entity extraction (with extra args)
+docker compose run --rm extract --resume
+docker compose run --rm extract --section DataSet_01 --limit 20
+
+# Migrate with args
+docker compose run --rm migrate --setup
+docker compose run --rm migrate --migrate --limit 100
+
+# Debug shell
+docker compose run --rm --entrypoint bash dashboard
 ```
 
-### Step 4 — Test upgraded swarm
-```bash
-# Document query now uses Weaviate hybrid search automatically
-python3 swarm.py -q "What financial connections appear between Epstein and Deutsche Bank?"
+## Phase 5: IntellYWeave Integration — Reference
 
-# Geospatial analysis
-python3 swarm.py --agent geospatial_analyst
+All Phase 5 setup is now handled by the Docker commands above. For reference, the underlying scripts are:
 
-# Full 6-phase intelligence orchestrator
-python3 swarm.py -q "Provide a comprehensive analysis of Jeffrey Epstein's network"
-
-# Courthouse debate standalone test
-python3 courthouse_debate.py \
-  --finding "Epstein had financial ties to Deutsche Bank" \
-  --evidence '[{"doc_id": "doc123", "relevance": "wire transfer records"}]'
-```
+| Script | Docker equivalent |
+|--------|------------------|
+| `weaviate_setup.py --setup && --migrate` | `make migrate` |
+| `gliner_reextract.py --update-weaviate` | `make gliner` |
+| `swarm.py -q "..."` | `make swarm Q="..."` |
+| `geospatial_agent.py --analyze` | `docker compose run --rm swarm --agent geospatial_analyst` |
+| `courthouse_debate.py --finding "..."` | `docker compose run --rm swarm` (auto-runs inside Coordinator) |
 
 ---
 

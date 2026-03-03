@@ -1,0 +1,151 @@
+# ── E-FINDER — Docker Compose ─────────────────────────────────────────────────
+# Services:
+#   weaviate   — vector database (hybrid BM25 + semantic search)
+#   dashboard  — Flask API + React UI  (port 5000)
+#   swarm      — one-shot CLI runner (run via: docker compose run --rm swarm -q "...")
+#   extract    — entity extraction pipeline (run via: docker compose run --rm extract)
+#   gliner     — GLiNER secondary NER pass (run via: docker compose run --rm gliner)
+#   migrate    — MongoDB → Weaviate migration (run via: docker compose run --rm migrate)
+#
+# Quick start:
+#   cp .env.example .env          # fill in MONGODB_URI, ANTHROPIC_API_KEY, OPENAI_API_KEY
+#   docker compose up -d          # start Weaviate + dashboard
+#   docker compose logs -f        # watch logs
+#   open http://localhost:5000    # open dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Weaviate vector database ──────────────────────────────────────────────
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.25.4
+    container_name: efinder-weaviate
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: text2vec-openai
+      ENABLE_MODULES: text2vec-openai
+      OPENAI_APIKEY: ${OPENAI_API_KEY}
+      CLUSTER_HOSTNAME: efinder-weaviate
+      LOG_LEVEL: warning
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Dashboard (Flask API + React UI) ─────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: efinder-app
+    container_name: efinder-dashboard
+    restart: unless-stopped
+    command: dashboard
+    ports:
+      - "${DASHBOARD_PORT:-5000}:5000"
+    env_file: .env
+    environment:
+      WEAVIATE_URL: http://weaviate:8080
+    volumes:
+      # Mount PDF library if present on host (read-only)
+      - ${PDF_LIBRARY_PATH:-/dev/null}:/pdfs:ro
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/api/stats"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Swarm CLI (one-shot investigation runner) ─────────────────────────────
+  # Usage: docker compose run --rm swarm -q "Who are the most connected people?"
+  swarm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: efinder-app
+    container_name: efinder-swarm
+    command: swarm
+    env_file: .env
+    environment:
+      WEAVIATE_URL: http://weaviate:8080
+    volumes:
+      - ${PDF_LIBRARY_PATH:-/dev/null}:/pdfs:ro
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    profiles:
+      - tools
+
+  # ── Entity extraction pipeline ────────────────────────────────────────────
+  # Usage: docker compose run --rm extract --resume
+  #        docker compose run --rm extract --limit 50
+  extract:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: efinder-app
+    container_name: efinder-extract
+    command: extract
+    env_file: .env
+    volumes:
+      - ${PDF_LIBRARY_PATH:-/dev/null}:/pdfs:ro
+      - extraction_logs:/app/logs
+    profiles:
+      - tools
+
+  # ── GLiNER secondary NER pass ─────────────────────────────────────────────
+  # Usage: docker compose run --rm gliner --limit 500
+  #        docker compose run --rm gliner --update-weaviate
+  gliner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: efinder-app
+    container_name: efinder-gliner
+    command: gliner
+    env_file: .env
+    environment:
+      WEAVIATE_URL: http://weaviate:8080
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    profiles:
+      - tools
+
+  # ── MongoDB → Weaviate migration ──────────────────────────────────────────
+  # Usage: docker compose run --rm migrate --setup
+  #        docker compose run --rm migrate --migrate --limit 100
+  #        docker compose run --rm migrate --migrate
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: efinder-app
+    container_name: efinder-migrate
+    command: migrate
+    env_file: .env
+    environment:
+      WEAVIATE_URL: http://weaviate:8080
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    profiles:
+      - tools
+
+volumes:
+  weaviate_data:
+    driver: local
+  extraction_logs:
+    driver: local

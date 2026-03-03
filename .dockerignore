@@ -1,0 +1,78 @@
+# ── E-FINDER — .dockerignore ──────────────────────────────────────────────────
+# Keep the Docker build context lean — exclude everything that doesn't
+# need to be inside the image.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Git
+.git/
+.gitignore
+
+# Environment / secrets (injected at runtime via .env)
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Large data files — PDFs are mounted as a volume, not baked into the image
+*.pdf
+doj_full_library/
+pdfs/
+*.csv
+*.tsv
+*.db
+*.sqlite
+
+# Logs
+*.log
+*.log.*
+
+# Generated outputs
+*.geojson
+*.gexf
+*.graphml
+entity_relationship_map.html
+network_map.html
+weaviate_data/
+serve/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.sublime-*
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Docs / markdown (not needed at runtime)
+*.md
+!README.md
+
+# Test files
+test_*.py
+*_test.py
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Temp
+*.tmp
+*.bak
+*~
+scratch/
+tmp/
