@@ -248,16 +248,25 @@ def migrate(client, db, limit: Optional[int] = None, skip_existing: bool = True)
     """Migrate MongoDB documents → Weaviate chunks."""
     collection = client.collections.get(COLLECTION_NAME)
 
-    # Find already-migrated doc_ids to support resume
+    # Find already-migrated doc_ids to support resume (paginated to avoid query limit)
     migrated_ids = set()
     if skip_existing:
         log.info("Checking for already-migrated documents...")
-        response = collection.query.fetch_objects(
-            return_properties=["doc_id"],
-            limit=100_000,
-        )
-        for obj in response.objects:
-            migrated_ids.add(obj.properties.get("doc_id", ""))
+        PAGE_SIZE = 1000
+        offset = 0
+        while True:
+            response = collection.query.fetch_objects(
+                return_properties=["doc_id"],
+                limit=PAGE_SIZE,
+                offset=offset,
+            )
+            if not response.objects:
+                break
+            for obj in response.objects:
+                migrated_ids.add(obj.properties.get("doc_id", ""))
+            if len(response.objects) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
         log.info("Already migrated: %d documents", len(migrated_ids))
 
     # Query MongoDB
