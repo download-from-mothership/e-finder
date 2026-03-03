@@ -8,10 +8,11 @@
 #   migrate    — MongoDB → Weaviate migration (run via: docker compose run --rm migrate)
 #
 # Quick start:
-#   cp .env.example .env          # fill in MONGODB_URI, ANTHROPIC_API_KEY, OPENAI_API_KEY
-#   docker compose up -d          # start Weaviate + dashboard
+#   cp .env.example .env          # fill in MONGODB_URI, ANTHROPIC_API_KEY, OPENAI_API_KEY,
+#                                 # CLOUDFLARE_TUNNEL_TOKEN
+#   docker compose up -d          # start Weaviate + dashboard + Cloudflare Tunnel
 #   docker compose logs -f        # watch logs
-#   open http://localhost:5000    # open dashboard
+#   open https://epsteinarchive.net  # public URL via Cloudflare Tunnel
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -123,6 +124,19 @@ services:
         condition: service_healthy
     profiles:
       - tools
+
+  # ── Cloudflare Tunnel ───────────────────────────────────────────────────────
+  # Exposes the dashboard at https://epsteinarchive.net via the named efinder tunnel.
+  # Requires CLOUDFLARE_TUNNEL_TOKEN in .env
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: efinder-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    network_mode: host   # must use host networking so cloudflared can reach localhost:5000
 
   # ── MongoDB → Weaviate migration ──────────────────────────────────────────
   # Usage: docker compose run --rm migrate --setup

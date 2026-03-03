@@ -15,7 +15,7 @@ help:
 	@echo ""
 	@echo "  E-FINDER — Docker commands"
 	@echo "  ──────────────────────────────────────────────────────"
-	@echo "  make up              Start Weaviate + dashboard (detached)"
+	@echo "  make up              Start Weaviate + dashboard + Cloudflare Tunnel (detached)"
 	@echo "  make down            Stop all services"
 	@echo "  make build           Rebuild the app image"
 	@echo "  make logs            Tail all service logs"
@@ -40,8 +40,9 @@ help:
 up:
 	docker compose up -d
 	@echo ""
-	@echo "  ✓ Dashboard: http://localhost:$${DASHBOARD_PORT:-5000}"
-	@echo "  ✓ Weaviate:  http://localhost:8080"
+	@echo "  ✓ Public:    https://epsteinarchive.net (via Cloudflare Tunnel)"
+	@echo "  ✓ Dashboard: http://localhost:$${DASHBOARD_PORT:-5000} (local)"
+	@echo "  ✓ Weaviate:  http://localhost:8080 (local)"
 	@echo ""
 
 down:
