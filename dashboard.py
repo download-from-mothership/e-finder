@@ -65,6 +65,92 @@ def _cache_get(key):
 def _cache_set(key, value, ttl=600):
     _cache[key] = (value, time.time() + ttl)
 
+
+def _prewarm_cache():
+    """Pre-warm expensive caches in a background thread on startup."""
+    import logging
+    log = logging.getLogger(__name__)
+    try:
+        time.sleep(3)  # let gunicorn fully start first
+        db = get_db()
+
+        # Pre-warm stats (fast)
+        result = {
+            "total_docs": db["documents"].count_documents({}),
+            "extracted_docs": db["documents"].count_documents({"processing_stage": "entities_extracted"}),
+            "total_entities": db["entities"].count_documents({}),
+            "network_edges": db["network"].count_documents({}),
+            "reports": db["reports"].count_documents({}),
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        _cache_set("stats", result, ttl=120)
+        log.info("Cache pre-warm: stats done")
+
+        # Pre-warm network graph (slow — 600+ queries, run in background)
+        min_weight = MIN_EDGE_WEIGHT
+        max_nodes = MAX_NODES
+        cache_key = f"network_{min_weight}_{max_nodes}"
+
+        edges_raw = list(db["network"].find(
+            {"weight": {"$gte": min_weight}},
+            {"person1": 1, "person2": 1, "weight": 1, "shared_doc_ids": 1, "_id": 0}
+        ).sort("weight", -1))
+
+        node_degree = defaultdict(int)
+        node_weighted_degree = defaultdict(int)
+        for e in edges_raw:
+            node_degree[e["person1"]] += 1
+            node_degree[e["person2"]] += 1
+            node_weighted_degree[e["person1"]] += e["weight"]
+            node_weighted_degree[e["person2"]] += e["weight"]
+
+        top_nodes = sorted(node_weighted_degree.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+        node_set = set(n for n, _ in top_nodes)
+
+        edges = []
+        for e in edges_raw:
+            if e["person1"] in node_set and e["person2"] in node_set:
+                edges.append({
+                    "source": e["person1"],
+                    "target": e["person2"],
+                    "weight": e["weight"],
+                    "docs": len(e.get("shared_doc_ids", [])),
+                })
+                if len(edges) >= MAX_EDGES:
+                    break
+
+        nodes = []
+        for name in node_set:
+            doc_count = db["entities"].count_documents({"name": name, "entity_type": "person"})
+            section_pipeline = [
+                {"$match": {"name": name, "entity_type": "person"}},
+                {"$group": {"_id": "$section", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+                {"$limit": 3},
+            ]
+            sections = [r["_id"] for r in db["entities"].aggregate(section_pipeline)]
+            node_type, role_str = _classify_person_role(db, name)
+            nodes.append({
+                "id": name,
+                "doc_count": doc_count,
+                "degree": node_degree[name],
+                "weighted_degree": node_weighted_degree[name],
+                "sections": sections,
+                "role": role_str[:150],
+                "type": node_type,
+            })
+
+        _cache_set(cache_key, {"nodes": nodes, "edges": edges}, ttl=600)
+        log.info("Cache pre-warm: network graph done (%d nodes, %d edges)", len(nodes), len(edges))
+    except Exception as exc:
+        log.warning("Cache pre-warm failed: %s", exc)
+
+
+# Start cache pre-warming in background when module loads (works with gunicorn)
+_prewarm_thread = threading.Thread(target=_prewarm_cache, daemon=True)
+_prewarm_thread.start()
+
+
 def get_db():
     global _db
     if _db is None:
