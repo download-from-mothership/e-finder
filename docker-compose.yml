@@ -19,7 +19,7 @@ services:
 
   # ── Weaviate vector database ──────────────────────────────────────────────
   weaviate:
-    image: cr.weaviate.io/semitechnologies/weaviate:1.25.4
+    image: cr.weaviate.io/semitechnologies/weaviate:1.27.2
     container_name: efinder-weaviate
     restart: unless-stopped
     ports:
