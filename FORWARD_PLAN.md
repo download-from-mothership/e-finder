@@ -180,35 +180,66 @@ The entire stack is now containerised. No virtual environments, no manual pip in
 | `Makefile` | Shorthand `make` commands |
 | `docker/entrypoint.sh` | Routes container CMD to the correct Python script |
 
-### Quick start
+### Deployment target
+Everything runs on the **Hetzner VPS** (168.119.227.211). No steps are needed on your Mac. The dashboard is publicly accessible at **https://epsteinarchive.net** via the existing named Cloudflare Tunnel (`efinder`).
+
+### One-time VPS setup
 ```bash
-# 1. Clone the repo and enter it
-git clone https://github.com/download-from-mothership/e-finder.git
-cd e-finder
+# SSH into the VPS
+ssh your-vps
 
-# 2. Set up secrets
+# Install Docker (if not already installed)
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER && newgrp docker
+
+# Clone the repo
+git clone https://github.com/download-from-mothership/e-finder.git ~/efinder
+cd ~/efinder
+
+# Set up secrets
 cp .env.example .env
-# Edit .env — fill in MONGODB_URI, ANTHROPIC_API_KEY, OPENAI_API_KEY
-# Optionally set PDF_LIBRARY_PATH to your local PDF library path
+nano .env
+# Fill in:
+#   MONGODB_URI=mongodb+srv://...
+#   ANTHROPIC_API_KEY=sk-ant-...
+#   OPENAI_API_KEY=sk-...
+#   PDF_LIBRARY_PATH=/path/to/doj_full_library
+#   CLOUDFLARE_TUNNEL_TOKEN=eyJ...   ← get this with: ps aux | grep cloudflared
 
-# 3. Start Weaviate + dashboard
+# Start everything (Weaviate + dashboard + Cloudflare Tunnel)
 make up
-# → Dashboard: http://localhost:5000
+# → Public:    https://epsteinarchive.net
+# → Local:     http://localhost:5000
 # → Weaviate:  http://localhost:8080
+```
 
-# 4. Migrate corpus to Weaviate (first time only)
-make migrate-test    # test with 100 docs first
-make migrate         # full 26K migration
+### Finding the Cloudflare Tunnel token on the VPS
+The token is already in use on the VPS. Retrieve it with:
+```bash
+# Option 1 — from the running cloudflared process
+ps aux | grep cloudflared | grep -o -- '--token [^ ]*' | awk '{print $2}'
 
-# 5. Run GLiNER extraction pass (first time only)
-make gliner-test     # test with 500 docs
-make gliner          # full corpus
+# Option 2 — from the systemd service
+systemctl cat cloudflared 2>/dev/null | grep token
 
-# 6. Build the network map
-make network-map
+# Option 3 — from cloudflared config
+cat /etc/cloudflared/config.yml 2>/dev/null
+cat ~/.cloudflared/*.json 2>/dev/null | python3 -m json.tool
+```
+Once you have it, add it to `.env` as `CLOUDFLARE_TUNNEL_TOKEN=eyJ...` and stop the old cloudflared process (Docker will manage it from now on):
+```bash
+# Stop the old standalone cloudflared
+sudo systemctl stop cloudflared && sudo systemctl disable cloudflared
+# Docker Compose will restart it automatically
+```
 
-# 7. Run an investigation
-make swarm Q="Who are the most connected people in the corpus?"
+### Updating the deployment
+```bash
+# On the VPS, pull latest code and restart
+cd ~/efinder
+git pull
+make build   # rebuild image if code changed
+make down && make up
 ```
 
 ### All available commands
