@@ -1,26 +1,121 @@
-# OS
+# ── OS artifacts ─────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
 Thumbs.db
+ehthumbs.db
+desktop.ini
 
-# Environment
+# ── Environment & secrets ─────────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.p12
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
 venv/
-__pycache__/
-*.pyc
+env/
+ENV/
+.virtualenv/
 
-# Large data files (not code)
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Large data files (not code) ───────────────────────────────────────────────
+# JSON data dumps — keep package.json and similar config files
 *.json
 !package.json
+!package-lock.json
+!tsconfig.json
+!jsconfig.json
+
+# PDF library (stored on VPS / ProtonDrive, not in git)
+*.pdf
+doj_full_library/
+pdfs/
+
+# CSV / TSV data exports
+*.csv
+*.tsv
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Log files ─────────────────────────────────────────────────────────────────
+*.log
+*.log.*
 download.log
 extraction_progress.log
-*.log
+swarm_run_*.log
 
-# Generated outputs
+# ── Generated outputs ─────────────────────────────────────────────────────────
+# Network / graph visualisations
 entity_relationship_map.html
+network_map.html
+*.gexf
+*.graphml
+
+# GeoJSON exports from geospatial_agent.py
+location_intelligence.geojson
+*.geojson
+
+# Weaviate local data volume (Docker bind-mount)
+weaviate_data/
+
+# Dashboard build artefacts
 serve/
+dist/
+build/
 pageindex_trees/
 
-# IDE
+# Temporary / scratch files
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+scratch/
+tmp/
+
+# ── IDE & editor ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+.cursor/
+
+# ── Testing & coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+nosetests.xml
+test-results/
+
+# ── Node (dashboard / JSX components) ────────────────────────────────────────
+node_modules/
+.pnpm-store/
+.yarn/
+.npm/
