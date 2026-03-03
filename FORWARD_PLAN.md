@@ -1,7 +1,7 @@
 # DOJ Epstein Document Analysis Pipeline — Forward Plan
 
-**Last updated:** March 1, 2026
-**Status:** Phase 3 complete. Phase 4 (swarm) designed and built. Extraction running on VPS.
+**Last updated:** March 2, 2026
+**Status:** Phase 3 complete. Phase 4 (swarm) complete. **IntellYWeave integration complete (Phase 5).**
 
 ---
 
@@ -49,6 +49,8 @@
 | `network` | ○ Ready | Empty | Co-occurrence graph edges (run swarm.py --agent network_mapper) |
 | `reports` | ○ Ready | Empty | Investigation reports from swarm |
 | `redactions` | ○ Schema ready | Empty | Detailed redaction analysis |
+| `gliner_entities` | ○ Ready | Empty | GLiNER-extracted cryptonyms, laws, events (run gliner_reextract.py) |
+| `location_intelligence` | ○ Ready | Empty | Geocoded location records (run geospatial_agent.py) |
 
 ---
 
@@ -91,7 +93,7 @@ python3 _pipeline_output/swarm.py --agent document_query -q "Find all financial 
 
 ## Agents — Current Roster
 
-### Built ✓
+### Built ✓ (Original)
 | Agent | Type | Purpose |
 |-------|------|---------|
 | Entity Resolver | Batch | Dedup "Jeffrey Epstein" / "EPSTEIN, JEFFREY" / "J. Epstein" → canonical entities |
@@ -101,7 +103,17 @@ python3 _pipeline_output/swarm.py --agent document_query -q "Find all financial 
 | Redaction Analyst | Analysis | Systematic analysis of what's being redacted and why |
 | Coordinator | Orchestration | Routes questions to agents, synthesizes findings, stores reports |
 
-### Planned (Phase 4 continued)
+### Built ✓ (IntellYWeave Integration — Phase 5)
+| Agent / Module | Type | Source | Purpose |
+|----------------|------|--------|---------|
+| `DocumentQueryAgentV2` | Search | IntellYWeave (adapted) | Weaviate hybrid (BM25 + vector) + MongoDB fallback. Auto-replaces DocumentQueryAgent when Weaviate is available |
+| `GLiNER Extractor` | Batch NER | IntellYWeave (adapted) | Zero-shot extraction of cryptonyms, laws, events, FOIA codes — no API cost |
+| `Courthouse Debate` | Validation | IntellYWeave (adapted) | Prosecution → Defense → Judge adversarial validation of every finding before it enters a report |
+| `Intelligence Orchestrator` | Analysis | IntellYWeave (adapted) | 6-phase analysis: Extract → Map → Geospatial → Network → Patterns → Synthesize |
+| `Geospatial Analyst` | Analysis | IntellYWeave (adapted) | Location frequency, geocoding, co-occurrence with entities, GeoJSON export for Mapbox GL |
+| `Weaviate Setup` | Infrastructure | IntellYWeave (adapted) | MongoDB → Weaviate migration, schema creation, hybrid search testing |
+
+### Planned (Future)
 | Agent | Type | Purpose |
 |-------|------|---------|
 | Link Analyst | Analysis | Find hidden connections through shared entities |
@@ -123,7 +135,13 @@ python3 _pipeline_output/swarm.py --agent document_query -q "Find all financial 
 | `SWARM_ARCHITECTURE.md` | Full swarm design document | Complete |
 | `extract_entities.py` | PDF → text → Claude → MongoDB pipeline (v2) | Running on VPS |
 | `entity_resolver.py` | Deduplicate entities collection | Ready |
-| `swarm.py` | Coordinator + 4 specialist agents | Ready |
+| `swarm.py` | Coordinator + 6 agents (IntellYWeave-upgraded) | Updated |
+| `weaviate_setup.py` | Weaviate schema + MongoDB → Weaviate migration | **New (IntellYWeave)** |
+| `document_query_weaviate.py` | Upgraded DocumentQuery with hybrid search | **New (IntellYWeave)** |
+| `gliner_reextract.py` | GLiNER secondary NER pass (cryptonyms, laws, events) | **New (IntellYWeave)** |
+| `courthouse_debate.py` | Adversarial finding validation (prosecution/defense/judge) | **New (IntellYWeave)** |
+| `intelligence_orchestrator.py` | 6-phase intelligence analysis orchestrator | **New (IntellYWeave)** |
+| `geospatial_agent.py` | Location intelligence + geocoding + GeoJSON export | **New (IntellYWeave)** |
 | `setup_mongodb.py` | MongoDB collection/index setup | Complete |
 | `ingest_metadata.py` | Bulk metadata ingestion | Complete (26,138 docs) |
 | `integrity_check.py` | PDF validation + dedup | Complete |
@@ -146,11 +164,63 @@ python3 _pipeline_output/swarm.py --agent document_query -q "Find all financial 
 
 ---
 
+## Phase 5: IntellYWeave Integration — Setup Steps
+
+Run these **after** entity extraction completes, in order:
+
+### Step 1 — Start Weaviate (Docker required)
+```bash
+docker run -d -p 8080:8080 -p 50051:50051 \
+  -e AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
+  -e PERSISTENCE_DATA_PATH=/var/lib/weaviate \
+  -v weaviate_data:/var/lib/weaviate \
+  cr.weaviate.io/semitechnologies/weaviate:latest
+```
+
+### Step 2 — Migrate MongoDB → Weaviate
+```bash
+export OPENAI_API_KEY="sk-..."
+export WEAVIATE_URL="http://localhost:8080"
+python3 weaviate_setup.py --setup           # Create schema
+python3 weaviate_setup.py --migrate --limit 100  # Test with 100 docs
+python3 weaviate_setup.py --migrate         # Full migration (26K docs)
+python3 weaviate_setup.py --stats           # Verify
+```
+
+### Step 3 — Run GLiNER extraction
+```bash
+pip install gliner
+python3 gliner_reextract.py --dry-run --limit 5   # Preview
+python3 gliner_reextract.py --limit 500           # Test batch
+python3 gliner_reextract.py --update-weaviate     # Full run + update Weaviate
+python3 gliner_reextract.py --stats               # Show cryptonyms/laws/events found
+```
+
+### Step 4 — Test upgraded swarm
+```bash
+# Document query now uses Weaviate hybrid search automatically
+python3 swarm.py -q "What financial connections appear between Epstein and Deutsche Bank?"
+
+# Geospatial analysis
+python3 swarm.py --agent geospatial_analyst
+
+# Full 6-phase intelligence orchestrator
+python3 swarm.py -q "Provide a comprehensive analysis of Jeffrey Epstein's network"
+
+# Courthouse debate standalone test
+python3 courthouse_debate.py \
+  --finding "Epstein had financial ties to Deutsche Bank" \
+  --evidence '[{"doc_id": "doc123", "relevance": "wire transfer records"}]'
+```
+
+---
+
 ## Immediate Next Steps (Priority Order)
 
 1. ✅ ~~Monitor VPS extraction progress~~ — Running, check with `tail -f`
 2. **When extraction completes:** Run entity resolver (`entity_resolver.py --use-claude`)
 3. **Then:** Run network mapper (`swarm.py --agent network_mapper`)
-4. **Then:** Start interactive investigation (`swarm.py --interactive`)
-5. **Ongoing:** Build remaining Layer 2 + Layer 3 agents as needed
-6. **Future:** Dashboard visualization (entity graph, timeline, redaction heatmap)
+4. **Then:** Set up Weaviate + migrate corpus (Phase 5, Steps 1–2 above)
+5. **Then:** Run GLiNER extraction pass (Phase 5, Step 3 above)
+6. **Then:** Start interactive investigation (`swarm.py --interactive`)
+7. **Future:** Dashboard visualization — integrate Mapbox GL with `location_intelligence.geojson`

@@ -683,30 +683,72 @@ Return JSON:
 # Coordinator
 # ═══════════════════════════════════════════
 
+# ── IntellYWeave integration: load upgraded agents if available ───────────────
+try:
+    from document_query_weaviate import DocumentQueryAgentV2
+    _DocumentQueryClass = DocumentQueryAgentV2
+    log.info("Using DocumentQueryAgentV2 (Weaviate hybrid search)")
+except ImportError:
+    _DocumentQueryClass = DocumentQueryAgent
+    log.info("Using DocumentQueryAgent (MongoDB only)")
+
+try:
+    from intelligence_orchestrator import IntelligenceOrchestratorAgent
+    _IntelligenceOrchestratorClass = IntelligenceOrchestratorAgent
+    log.info("IntelligenceOrchestratorAgent loaded")
+except ImportError:
+    _IntelligenceOrchestratorClass = None
+    log.info("IntelligenceOrchestratorAgent not available")
+
+try:
+    from geospatial_agent import GeospatialAnalystAgent
+    _GeospatialClass = GeospatialAnalystAgent
+    log.info("GeospatialAnalystAgent loaded")
+except ImportError:
+    _GeospatialClass = None
+    log.info("GeospatialAnalystAgent not available")
+
 AGENT_REGISTRY = {
-    "network_mapper": NetworkMapperAgent,
-    "document_query": DocumentQueryAgent,
-    "timeline_builder": TimelineBuilderAgent,
+    "network_mapper":    NetworkMapperAgent,
+    "document_query":    _DocumentQueryClass,
+    "timeline_builder":  TimelineBuilderAgent,
     "redaction_analyst": RedactionAnalystAgent,
 }
+
+# Register IntellYWeave agents if available
+if _IntelligenceOrchestratorClass:
+    AGENT_REGISTRY["intelligence_orchestrator"] = _IntelligenceOrchestratorClass
+if _GeospatialClass:
+    AGENT_REGISTRY["geospatial_analyst"] = _GeospatialClass
 
 ROUTING_PROMPT = """You are the coordinator of an OSINT investigation swarm analyzing DOJ Epstein documents.
 
 Available agents:
-- network_mapper: Build relationship graphs, find most connected people, detect communities. Task: {{"target": "optional person name", "min_weight": 2}}
-- document_query: Search and analyze documents with natural language. Task: {{"question": "the question"}}
-- timeline_builder: Build chronological timelines for a person/topic. Task: {{"subject": "person or topic name"}}
-- redaction_analyst: Analyze redaction patterns across the corpus. Task: {{"focus": "optional section/type"}}
+- network_mapper: Build relationship graphs, find most connected people, detect communities. Task: {"target": "optional person name", "min_weight": 2}
+- document_query: Search and analyze documents with natural language (Weaviate hybrid + MongoDB). Task: {"question": "the question", "alpha": 0.5}
+- timeline_builder: Build chronological timelines for a person/topic. Task: {"subject": "person or topic name"}
+- redaction_analyst: Analyze redaction patterns across the corpus. Task: {"focus": "optional section/type"}
+- intelligence_orchestrator: Full 6-phase analysis (Extract→Map→Geo→Network→Patterns→Synthesize). Use for complex questions needing comprehensive corpus analysis. Task: {"question": "the question"}
+- geospatial_analyst: Analyze location patterns, geocode locations, export GeoJSON for map visualization. Task: {"subject": "optional person", "export_geojson": "path.geojson"}
 
 Given this research question, decide which agents to run and in what order.
 
+Guidelines:
+- Use intelligence_orchestrator for broad, complex questions ("full network", "comprehensive analysis", "everything about X")
+- Use document_query for targeted questions about specific topics or documents
+- Use geospatial_analyst when the question involves locations, travel, or geographic patterns
+- Use network_mapper for relationship/connection questions
+- Use timeline_builder for chronological questions about a specific person or event
+- Use redaction_analyst for questions about what is hidden or classified
+- Do NOT use intelligence_orchestrator AND document_query for the same question — they overlap
+
 Return JSON:
-{{
+{
   "plan": [
-    {{"agent": "agent_name", "task": {{...}}, "depends_on": [], "reason": "why this agent"}}
+    {"agent": "agent_name", "task": {...}, "depends_on": [], "reason": "why this agent"}
   ],
   "synthesis_strategy": "how to combine the results"
-}}
+}
 
 Keep the plan focused — don't use agents that aren't relevant to the question.
 
@@ -777,6 +819,31 @@ class Coordinator:
         # Step 3: Synthesize
         print(f"\n  Synthesizing findings...")
         report = self._synthesize(question, results, plan.get("synthesis_strategy", ""))
+
+        # Step 4: Courthouse Debate — adversarial validation of key findings
+        try:
+            from courthouse_debate import CourthouseDebate
+            if report.get("key_findings"):
+                print(f"\n  Running Courthouse Debate on {len(report['key_findings'])} findings...")
+                debate = CourthouseDebate(self.claude)
+                # Build evidence map from agent results
+                evidence_by_finding = {}
+                for f in report.get("key_findings", []):
+                    finding_text = f.get("finding", "")
+                    evidence = []
+                    for agent_name, r in results.items():
+                        for ev in (r.evidence or []):
+                            evidence.append(ev)
+                    evidence_by_finding[finding_text] = evidence[:10]
+                report = debate.adjudicate_report(report, evidence_by_finding)
+                cs = report.get("courthouse_summary", {})
+                print(f"  Courthouse: {cs.get('confirmed',0)} confirmed, "
+                      f"{cs.get('contested',0)} contested, "
+                      f"{cs.get('insufficient_evidence',0)} insufficient")
+        except ImportError:
+            pass  # courthouse_debate.py not in path
+        except Exception as e:
+            log.warning("Courthouse debate failed (non-fatal): %s", e)
 
         elapsed = time.time() - start
         total_api = sum(r.api_calls for r in results.values()) + 2  # +2 for plan + synthesis
