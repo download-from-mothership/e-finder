@@ -142,6 +142,42 @@ def _prewarm_cache():
 
         _cache_set(cache_key, {"nodes": nodes, "edges": edges}, ttl=600)
         log.info("Cache pre-warm: network graph done (%d nodes, %d edges)", len(nodes), len(edges))
+
+        # Pre-warm entity breakdown (fast aggregation)
+        eb_pipeline = [
+            {"$group": {"_id": "$entity_type", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+        ]
+        eb_result = [{"type": r["_id"], "count": r["count"]}
+                     for r in db["entities"].aggregate(eb_pipeline)]
+        _cache_set("entity_breakdown", eb_result, ttl=300)
+        log.info("Cache pre-warm: entity breakdown done")
+
+        # Pre-warm top-entities (person, limit=12 — the dashboard default)
+        te_pipeline = [
+            {"$match": {"entity_type": "person"}},
+            {"$group": {"_id": "$name", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 12},
+        ]
+        te_results = list(db["entities"].aggregate(te_pipeline))
+        te_enriched = []
+        for r in te_results:
+            role_type, role_desc = _classify_person_role(db, r["_id"])
+            te_enriched.append({"name": r["_id"], "count": r["count"],
+                                 "type": role_type, "role": role_desc})
+        _cache_set("top_entities_person_12", te_enriched, ttl=300)
+        log.info("Cache pre-warm: top-entities done")
+
+        # Pre-warm reports list
+        reports = list(db["reports"].find(
+            {},
+            {"_id": 0, "question": 1, "executive_summary": 1,
+             "key_findings": 1, "meta": 1, "timestamp": 1}
+        ).sort("timestamp", -1).limit(20))
+        _cache_set("reports", reports, ttl=60)
+        log.info("Cache pre-warm: reports done")
+
     except Exception as exc:
         log.warning("Cache pre-warm failed: %s", exc)
 
@@ -269,20 +305,28 @@ def api_network():
 
 @app.route("/api/reports")
 def api_reports():
+    cached = _cache_get("reports")
+    if cached:
+        return jsonify(cached)
     db = get_db()
     reports = list(db["reports"].find(
         {},
         {"_id": 0, "question": 1, "executive_summary": 1, "key_findings": 1,
          "meta": 1, "timestamp": 1}
     ).sort("timestamp", -1).limit(20))
+    _cache_set("reports", reports, ttl=60)  # cache for 1 minute
     return jsonify(reports)
 
 
 @app.route("/api/top-entities")
 def api_top_entities():
-    db = get_db()
     entity_type = request.args.get("type", "person")
     limit = int(request.args.get("limit", 25))
+    cache_key = f"top_entities_{entity_type}_{limit}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return jsonify(cached)
+    db = get_db()
     pipeline = [
         {"$match": {"entity_type": entity_type}},
         {"$group": {"_id": "$name", "count": {"$sum": 1}}},
@@ -300,18 +344,31 @@ def api_top_entities():
         else:
             entry["type"] = entity_type
         enriched.append(entry)
+    _cache_set(cache_key, enriched, ttl=300)  # cache for 5 minutes
     return jsonify(enriched)
 
 
 @app.route("/api/entity-breakdown")
 def api_entity_breakdown():
+    cached = _cache_get("entity_breakdown")
+    if cached:
+        return jsonify(cached)
     db = get_db()
     pipeline = [
         {"$group": {"_id": "$entity_type", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
     ]
     results = list(db["entities"].aggregate(pipeline))
-    return jsonify([{"type": r["_id"], "count": r["count"]} for r in results])
+    result = [{"type": r["_id"], "count": r["count"]} for r in results]
+    _cache_set("entity_breakdown", result, ttl=300)  # cache for 5 minutes
+    return jsonify(result)
+
+
+# ─── Cache invalidation ─────────────────────────────────────────────
+def _invalidate_report_cache():
+    """Called after a new investigation completes to bust the reports cache."""
+    _cache.pop("reports", None)
+    _cache.pop("stats", None)
 
 
 # ─── Investigation state (in-memory) ─────────────────────────────────
@@ -348,6 +405,7 @@ def api_investigate():
             result = coord.investigate(q)
             _investigations[jid]["status"] = "complete"
             _investigations[jid]["result"] = result
+            _invalidate_report_cache()  # bust cache so new report appears immediately
         except Exception as e:
             _investigations[jid]["status"] = "error"
             _investigations[jid]["error"] = str(e)
