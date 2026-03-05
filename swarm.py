@@ -724,12 +724,12 @@ if _GeospatialClass:
 ROUTING_PROMPT = """You are the coordinator of an OSINT investigation swarm analyzing DOJ Epstein documents.
 
 Available agents:
-- network_mapper: Build relationship graphs, find most connected people, detect communities. Task: {"target": "optional person name", "min_weight": 2}
-- document_query: Search and analyze documents with natural language (Weaviate hybrid + MongoDB). Task: {"question": "the question", "alpha": 0.5}
-- timeline_builder: Build chronological timelines for a person/topic. Task: {"subject": "person or topic name"}
-- redaction_analyst: Analyze redaction patterns across the corpus. Task: {"focus": "optional section/type"}
-- intelligence_orchestrator: Full 6-phase analysis (Extract→Map→Geo→Network→Patterns→Synthesize). Use for complex questions needing comprehensive corpus analysis. Task: {"question": "the question"}
-- geospatial_analyst: Analyze location patterns, geocode locations, export GeoJSON for map visualization. Task: {"subject": "optional person", "export_geojson": "path.geojson"}
+- network_mapper: Build relationship graphs, find most connected people, detect communities. Task: {{"target": "optional person name", "min_weight": 2}}
+- document_query: Search and analyze documents with natural language (Weaviate hybrid + MongoDB). Task: {{"question": "the question", "alpha": 0.5}}
+- timeline_builder: Build chronological timelines for a person/topic. Task: {{"subject": "person or topic name"}}
+- redaction_analyst: Analyze redaction patterns across the corpus. Task: {{"focus": "optional section/type"}}
+- intelligence_orchestrator: Full 6-phase analysis (Extract→Map→Geo→Network→Patterns→Synthesize). Use for complex questions needing comprehensive corpus analysis. Task: {{"question": "the question"}}
+- geospatial_analyst: Analyze location patterns, geocode locations, export GeoJSON for map visualization. Task: {{"subject": "optional person", "export_geojson": "path.geojson"}}
 
 Given this research question, decide which agents to run and in what order.
 
@@ -743,12 +743,12 @@ Guidelines:
 - Do NOT use intelligence_orchestrator AND document_query for the same question — they overlap
 
 Return JSON:
-{
+{{
   "plan": [
-    {"agent": "agent_name", "task": {...}, "depends_on": [], "reason": "why this agent"}
+    {{"agent": "agent_name", "task": {{...}}, "depends_on": [], "reason": "why this agent"}}
   ],
   "synthesis_strategy": "how to combine the results"
-}
+}}
 
 Keep the plan focused — don't use agents that aren't relevant to the question.
 
