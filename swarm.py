@@ -30,6 +30,7 @@ import re
 import sys
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional
@@ -728,29 +729,42 @@ Available agents:
 - document_query: Search and analyze documents with natural language (Weaviate hybrid + MongoDB). Task: {{"question": "the question", "alpha": 0.5}}
 - timeline_builder: Build chronological timelines for a person/topic. Task: {{"subject": "person or topic name"}}
 - redaction_analyst: Analyze redaction patterns across the corpus. Task: {{"focus": "optional section/type"}}
-- intelligence_orchestrator: Full 6-phase analysis (Extract→Map→Geo→Network→Patterns→Synthesize). Use for complex questions needing comprehensive corpus analysis. Task: {{"question": "the question"}}
+- intelligence_orchestrator: Full 6-phase analysis (Extract→Map→Geo→Network→Patterns→Synthesize). Use ONLY for broad, complex questions needing comprehensive corpus analysis. Task: {{"question": "the question"}}
 - geospatial_analyst: Analyze location patterns, geocode locations, export GeoJSON for map visualization. Task: {{"subject": "optional person", "export_geojson": "path.geojson"}}
 
 Given this research question, decide which agents to run and in what order.
 
-Guidelines:
-- Use intelligence_orchestrator for broad, complex questions ("full network", "comprehensive analysis", "everything about X")
-- Use document_query for targeted questions about specific topics or documents
+COMPLEXITY ROUTING RULES (IMPORTANT — follow these strictly):
+
+SIMPLE questions (use 1-2 fast agents, ~30 seconds):
+  Examples: "who is X", "what documents mention Y", "when did X happen", "list people connected to X"
+  → Use: document_query and/or network_mapper only
+  → Do NOT use intelligence_orchestrator for simple lookups
+
+MEDIUM questions (use 2-3 agents, ~90 seconds):
+  Examples: "how are X and Y connected", "what is X's role", "what financial connections does X have", "timeline of X"
+  → Use: document_query + network_mapper, or document_query + timeline_builder
+  → Do NOT use intelligence_orchestrator unless the question truly requires all 6 phases
+
+COMPLEX questions (use intelligence_orchestrator, ~5-10 minutes):
+  Examples: "full network analysis", "comprehensive investigation of X", "everything about X", "all connections and patterns", "deep analysis"
+  → Use: intelligence_orchestrator (it runs all 6 phases internally)
+  → Do NOT combine intelligence_orchestrator with other agents
+
+Additional guidelines:
 - Use geospatial_analyst when the question involves locations, travel, or geographic patterns
-- Use network_mapper for relationship/connection questions
-- Use timeline_builder for chronological questions about a specific person or event
 - Use redaction_analyst for questions about what is hidden or classified
-- Do NOT use intelligence_orchestrator AND document_query for the same question — they overlap
+- Keep the plan focused — don't use agents that aren't relevant to the question
+- Prefer fewer, more targeted agents over many agents
 
 Return JSON:
 {{
+  "complexity": "simple|medium|complex",
   "plan": [
     {{"agent": "agent_name", "task": {{...}}, "depends_on": [], "reason": "why this agent"}}
   ],
   "synthesis_strategy": "how to combine the results"
 }}
-
-Keep the plan focused — don't use agents that aren't relevant to the question.
 
 QUESTION: {question}
 """
@@ -783,38 +797,58 @@ class Coordinator:
         for step in steps:
             print(f"    → {step['agent']}: {step.get('reason', '')}")
 
-        # Step 2: Execute agents
+        # Step 2: Execute agents — run independent agents in parallel
         results = {}
-        for step in steps:
+
+        def _run_agent(step):
             agent_name = step["agent"]
             task = step.get("task", {})
-
             if agent_name not in AGENT_REGISTRY:
                 log.warning("Unknown agent: %s", agent_name)
-                continue
-
-            # Check dependencies
-            deps = step.get("depends_on", [])
-            for dep in deps:
-                if dep in results and results[dep].error:
-                    log.warning("Skipping %s — dependency %s failed", agent_name, dep)
-                    continue
-
-            print(f"\n  Running {agent_name}...")
+                return agent_name, AgentResult(agent_name=agent_name, task=task,
+                                               error=f"Unknown agent: {agent_name}")
             agent_class = AGENT_REGISTRY[agent_name]
             agent = agent_class(self.db, self.claude)
-
             try:
                 agent_result = agent.run(task)
-                results[agent_name] = agent_result
-                print(f"    Done ({agent_result.duration_seconds:.1f}s, "
+                print(f"    [{agent_name}] Done ({agent_result.duration_seconds:.1f}s, "
                       f"{agent_result.api_calls} API calls, "
                       f"confidence={agent_result.confidence:.2f})")
+                return agent_name, agent_result
             except Exception as e:
                 log.error("Agent %s failed: %s", agent_name, e)
-                results[agent_name] = AgentResult(
-                    agent_name=agent_name, task=task, error=str(e)
-                )
+                return agent_name, AgentResult(agent_name=agent_name, task=task, error=str(e))
+
+        # Group steps into waves: steps with no unmet dependencies run in parallel
+        # Wave 0: steps with no depends_on
+        # Wave 1+: steps whose depends_on are all satisfied
+        pending = list(steps)
+        completed_agents = set()
+        wave = 0
+        while pending:
+            # Find steps whose dependencies are all satisfied
+            ready = [s for s in pending
+                     if all(d in completed_agents for d in s.get("depends_on", []))]
+            if not ready:
+                # Circular or unresolvable — just run remaining sequentially
+                ready = pending
+            pending = [s for s in pending if s not in ready]
+
+            wave += 1
+            if len(ready) == 1:
+                print(f"\n  Running {ready[0]['agent']}...")
+                name, result = _run_agent(ready[0])
+                results[name] = result
+                completed_agents.add(name)
+            else:
+                agent_names = [s["agent"] for s in ready]
+                print(f"\n  Running {len(ready)} agents in parallel: {', '.join(agent_names)}")
+                with ThreadPoolExecutor(max_workers=len(ready)) as executor:
+                    futures = {executor.submit(_run_agent, s): s for s in ready}
+                    for future in as_completed(futures):
+                        name, result = future.result()
+                        results[name] = result
+                        completed_agents.add(name)
 
         # Step 3: Synthesize
         print(f"\n  Synthesizing findings...")

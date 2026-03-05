@@ -43,6 +43,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -57,7 +58,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://localhost:8080")
 WEAVIATE_API_KEY = os.environ.get("WEAVIATE_API_KEY", "")
-MODEL = "claude-sonnet-4-5-20250929"
+MODEL = "claude-sonnet-4-5-20250929"          # Used for Phase 6 synthesis (quality matters)
+MODEL_FAST = "claude-haiku-3-5-20241022"     # Used for Phases 1 & 5 (structured extraction)
 COLLECTION_NAME = "EfinderChunks"
 
 
@@ -186,7 +188,7 @@ Return JSON:
 
         try:
             message = self.claude.messages.create(
-                model=MODEL, max_tokens=1024,
+                model=MODEL_FAST, max_tokens=1024,
                 messages=[{"role": "user", "content": subject_prompt}],
             )
             text = message.content[0].text.strip()
@@ -584,7 +586,7 @@ Identify significant patterns. Return JSON:
 
         try:
             message = self.claude.messages.create(
-                model=MODEL, max_tokens=3000,
+                model=MODEL_FAST, max_tokens=3000,
                 messages=[{"role": "user", "content": pattern_prompt}],
             )
             text = message.content[0].text.strip()
@@ -752,21 +754,54 @@ class IntelligenceOrchestratorAgent:
 
         ctx = PhaseContext(question=question, subject=question)
 
-        phases = [
-            ("Phase 1 — Extract",    lambda: ExtractorAgent(self.db, self.claude, self.weaviate).run(ctx)),
-            ("Phase 2 — Map",        lambda: MapperAgent(self.db, self.claude).run(ctx)),
-            ("Phase 3 — Geospatial", lambda: GeospatialAgent(self.db, self.claude).run(ctx)),
-            ("Phase 4 — Network",    lambda: NetworkAgent(self.db).run(ctx)),
-            ("Phase 5 — Patterns",   lambda: PatternDetectorAgent(self.db, self.claude).run(ctx)),
-        ]
+        # Phase 1 must run first (provides doc_ids and entities for all other phases)
+        try:
+            log.info("Running Phase 1 — Extract...")
+            ctx = ExtractorAgent(self.db, self.claude, self.weaviate).run(ctx)
+        except Exception as e:
+            log.error("Phase 1 — Extract failed: %s", e)
 
-        for phase_name, phase_fn in phases:
+        # Phases 2 and 3 are independent MongoDB queries — run them in parallel
+        def _run_phase2():
             try:
-                log.info("Running %s...", phase_name)
-                ctx = phase_fn()
+                return MapperAgent(self.db, self.claude).run(ctx)
             except Exception as e:
-                log.error("%s failed: %s", phase_name, e)
-                # Continue with partial context
+                log.error("Phase 2 — Map failed: %s", e)
+                return ctx
+
+        def _run_phase3():
+            try:
+                return GeospatialAgent(self.db, self.claude).run(ctx)
+            except Exception as e:
+                log.error("Phase 3 — Geospatial failed: %s", e)
+                return ctx
+
+        log.info("Running Phase 2 (Map) and Phase 3 (Geospatial) in parallel...")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f2 = executor.submit(_run_phase2)
+            f3 = executor.submit(_run_phase3)
+            ctx2 = f2.result()
+            ctx3 = f3.result()
+
+        # Merge phase 2 and 3 results back into ctx
+        ctx.relationship_map = ctx2.relationship_map
+        ctx.phase_results.update(ctx2.phase_results)
+        ctx.location_data = ctx3.location_data
+        ctx.phase_results.update(ctx3.phase_results)
+
+        # Phase 4 needs Phase 2 output (network edges)
+        try:
+            log.info("Running Phase 4 — Network...")
+            ctx = NetworkAgent(self.db).run(ctx)
+        except Exception as e:
+            log.error("Phase 4 — Network failed: %s", e)
+
+        # Phase 5 needs all prior phases
+        try:
+            log.info("Running Phase 5 — Patterns...")
+            ctx = PatternDetectorAgent(self.db, self.claude).run(ctx)
+        except Exception as e:
+            log.error("Phase 5 — Patterns failed: %s", e)
 
         # Phase 6: Synthesize
         try:
