@@ -629,8 +629,23 @@ function NetworkMap() {
   const [minWeight, setMinWeight] = useState(2);
   const [snapshotBuiltAt, setSnapshotBuiltAt] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  // All types active by default
+  const [activeTypes, setActiveTypes] = useState(new Set(Object.keys(TYPE_COLORS)));
   const simRef = useRef(null);
   const dataRef = useRef(null);
+
+  function toggleType(type) {
+    setActiveTypes(prev => {
+      const next = new Set(prev);
+      if (next.has(type)) {
+        // Don't allow deselecting all
+        if (next.size > 1) next.delete(type);
+      } else {
+        next.add(type);
+      }
+      return next;
+    });
+  }
 
   useEffect(() => {
     fetch('/api/network').then(r => r.json()).then(data => {
@@ -691,20 +706,24 @@ function NetworkMap() {
     // ── Pre-settle the simulation off-screen before first paint ──────────
     // Run the physics headlessly (no DOM ticks) so the graph appears already
     // in a stable layout rather than animating from a random starting state.
-    // alphaMin default is 0.001; we stop early at 0.01 for speed (~200 ticks).
-    const presettleWidth = 1200;  // virtual canvas size for pre-settle
-    const presettleHeight = 800;
+    const presettleWidth = 1600;
+    const presettleHeight = 1200;
     const presim = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(edges).id(d => d.id).distance(80)
-        .strength(d => Math.min(d.weight / 20, 0.5)))
-      .force("charge", d3.forceManyBody().strength(-120))
+      .force("link", d3.forceLink(edges).id(d => d.id)
+        .distance(d => 60 + (d.weight || 1) * 4)   // longer links for heavy edges = spread out
+        .strength(d => Math.min(d.weight / 30, 0.3)))
+      .force("charge", d3.forceManyBody()
+        .strength(d => -200 - sizeScale(d.weighted_degree) * 15)  // bigger nodes repel more
+        .distanceMax(400))
       .force("center", d3.forceCenter(presettleWidth / 2, presettleHeight / 2))
-      .force("collision", d3.forceCollide().radius(d => sizeScale(d.weighted_degree) + 2))
-      .alphaDecay(0.04)  // faster decay for pre-settle
+      .force("collision", d3.forceCollide()
+        .radius(d => sizeScale(d.weighted_degree) + 18)  // generous padding to prevent overlap
+        .strength(0.8))
+      .alphaDecay(0.025)  // slower decay = more thorough settling
       .stop();
-    // Tick until stable (max 300 iterations)
-    const maxTicks = 300;
-    for (let i = 0; i < maxTicks && presim.alpha() > 0.01; i++) presim.tick();
+    // Tick until stable (max 500 iterations for thorough layout)
+    const maxTicks = 500;
+    for (let i = 0; i < maxTicks && presim.alpha() > 0.005; i++) presim.tick();
     // Translate pre-settled positions to actual canvas centre
     const xExtent = d3.extent(nodes, d => d.x);
     const yExtent = d3.extent(nodes, d => d.y);
@@ -714,13 +733,18 @@ function NetworkMap() {
 
     // ── Live simulation for drag/interaction (starts near-stable) ────────
     const simulation = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(edges).id(d => d.id).distance(80)
-        .strength(d => Math.min(d.weight / 20, 0.5)))
-      .force("charge", d3.forceManyBody().strength(-120))
+      .force("link", d3.forceLink(edges).id(d => d.id)
+        .distance(d => 60 + (d.weight || 1) * 4)
+        .strength(d => Math.min(d.weight / 30, 0.3)))
+      .force("charge", d3.forceManyBody()
+        .strength(d => -200 - sizeScale(d.weighted_degree) * 15)
+        .distanceMax(400))
       .force("center", d3.forceCenter(width / 2, height / 2))
-      .force("collision", d3.forceCollide().radius(d => sizeScale(d.weighted_degree) + 2))
-      .alpha(0.05)     // start with very low alpha — nearly settled already
-      .alphaDecay(0.05); // decay quickly to rest
+      .force("collision", d3.forceCollide()
+        .radius(d => sizeScale(d.weighted_degree) + 18)
+        .strength(0.8))
+      .alpha(0.05)
+      .alphaDecay(0.05);
     simRef.current = simulation;
 
     const link = g.append("g").selectAll("line").data(edges).join("line")
@@ -737,14 +761,48 @@ function NetworkMap() {
         .on("drag", (e, d) => { d.fx=e.x; d.fy=e.y; })
         .on("end", (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx=null; d.fy=null; }));
 
-    const label = g.append("g").selectAll("text")
-      .data(nodes.filter(d => d.degree >= 15)).join("text")
+    // Label group: background rect + text for legibility
+    // Only show labels for high-degree nodes at default zoom; more appear as you zoom in
+    const LABEL_DEGREE_THRESHOLD = 20;  // show at default zoom
+    const labelG = g.append("g").attr("class", "labels");
+    const labelNodes = nodes.filter(d => d.degree >= 8);  // render all >=8, visibility via opacity
+    // Background rects (rendered first, sized after text)
+    const labelBg = labelG.selectAll("rect").data(labelNodes).join("rect")
+      .attr("fill", "rgba(5,5,8,0.82)")
+      .attr("rx", 2).attr("ry", 2)
+      .style("pointer-events", "none");
+    const label = labelG.selectAll("text").data(labelNodes).join("text")
       .text(d => d.id)
-      .attr("font-size", d => Math.max(9, Math.min(14, d.degree / 3)))
-      .attr("fill", "#ccc").attr("text-anchor", "middle")
-      .attr("dy", d => -sizeScale(d.weighted_degree) - 4)
-      .style("pointer-events", "none")
-      .style("text-shadow", "0 0 4px #000, 0 0 8px #000");
+      .attr("font-size", "11")
+      .attr("fill", d => d.degree >= LABEL_DEGREE_THRESHOLD ? "#ddd" : "#888")
+      .attr("text-anchor", "middle")
+      .attr("dy", d => -sizeScale(d.weighted_degree) - 5)
+      .style("pointer-events", "none");
+    // Size background rects to match text after render
+    label.each(function(d) {
+      try {
+        const bbox = this.getBBox();
+        const pad = 2;
+        d3.select(this.parentNode).selectAll("rect").filter((r) => r === d)
+          .attr("x", bbox.x - pad).attr("y", bbox.y - pad)
+          .attr("width", bbox.width + pad * 2).attr("height", bbox.height + pad * 2);
+      } catch(e) {}
+    });
+    // Zoom-aware label opacity: fade in lower-degree labels as user zooms in
+    zoom.on("zoom", (e) => {
+      g.attr("transform", e.transform);
+      const k = e.transform.k;
+      label.attr("fill-opacity", d => {
+        if (d.degree >= LABEL_DEGREE_THRESHOLD) return 1;
+        if (d.degree >= 12) return Math.min(1, (k - 0.8) / 0.7);
+        return Math.min(1, (k - 1.5) / 0.5);
+      });
+      labelBg.attr("fill-opacity", d => {
+        if (d.degree >= LABEL_DEGREE_THRESHOLD) return 0.82;
+        if (d.degree >= 12) return Math.min(0.82, (k - 0.8) / 0.7 * 0.82);
+        return Math.min(0.82, (k - 1.5) / 0.5 * 0.82);
+      });
+    });
 
     const tooltip = d3.select("#d3-tooltip");
 
@@ -774,12 +832,14 @@ function NetworkMap() {
         const t = typeof e.target === "object" ? e.target.id : e.target;
         return s === d.id || t === d.id ? "#8b5cf6" : "#1a1a3e";
       });
-      label.attr("fill-opacity", n => n.id === d.id || connected.has(n.id) ? 1 : 0.1);
+      label.attr("fill-opacity", n => n.id === d.id || connected.has(n.id) ? 1 : 0.05);
+      labelBg.attr("fill-opacity", n => n.id === d.id || connected.has(n.id) ? 0.82 : 0);
     }).on("mouseout", () => {
       tooltip.style("display", "none");
       node.attr("fill-opacity", 0.85);
       link.attr("stroke-opacity", 0.4).attr("stroke", "#1a1a3e");
       label.attr("fill-opacity", 1);
+      labelBg.attr("fill-opacity", 0.82);
     });
 
     // Render initial positions immediately (from pre-settle), then let live sim
@@ -788,7 +848,17 @@ function NetworkMap() {
       link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
           .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
       node.attr("cx", d => d.x).attr("cy", d => d.y);
+      // Move label text and its background rect together
       label.attr("x", d => d.x).attr("y", d => d.y);
+      label.each(function(d) {
+        try {
+          const bbox = this.getBBox();
+          const pad = 2;
+          labelBg.filter(r => r === d)
+            .attr("x", bbox.x - pad).attr("y", bbox.y - pad)
+            .attr("width", bbox.width + pad * 2).attr("height", bbox.height + pad * 2);
+        } catch(e) {}
+      });
     };
     applyPositions();  // paint immediately with pre-settled positions
     simulation.on("tick", applyPositions);
@@ -801,17 +871,32 @@ function NetworkMap() {
     }
 
     // Store refs for search/filter
-    dataRef.current = { nodes, edges, node, link, label, sizeScale };
+    dataRef.current = { nodes, edges, node, link, label, labelBg, sizeScale };
   }
+
+  // Apply type-filter whenever activeTypes changes
+  useEffect(() => {
+    if (!dataRef.current || !dataRef.current.node) return;
+    const { node, link, label, labelBg } = dataRef.current;
+    node.attr('display', d => activeTypes.has(d.type) ? null : 'none');
+    link.attr('display', e => {
+      const s = typeof e.source === 'object' ? e.source : {type: ''};
+      const t = typeof e.target === 'object' ? e.target : {type: ''};
+      return activeTypes.has(s.type) && activeTypes.has(t.type) ? null : 'none';
+    });
+    label.attr('display', d => activeTypes.has(d.type) ? null : 'none');
+    if (labelBg) labelBg.attr('display', d => activeTypes.has(d.type) ? null : 'none');
+  }, [activeTypes]);
 
   useEffect(() => {
     if (!dataRef.current || !dataRef.current.node) return;
-    const { nodes, edges, node, link, label } = dataRef.current;
+    const { nodes, edges, node, link, label, labelBg } = dataRef.current;
     const q = searchQuery.toLowerCase();
     if (!q) {
       node.attr("fill-opacity", 0.85);
       link.attr("stroke-opacity", 0.4).attr("stroke", "#1a1a3e");
       label.attr("fill-opacity", 1);
+      if (labelBg) labelBg.attr("fill-opacity", 0.82);
       return;
     }
     const matches = new Set();
@@ -830,6 +915,8 @@ function NetworkMap() {
       return matches.has(s) || matches.has(t) ? 0.6 : 0.02;
     });
     label.attr("fill-opacity", n => matches.has(n.id) ? 1 : connected.has(n.id) ? 0.6 : 0.05);
+    if (labelBg) labelBg.attr("fill-opacity",
+      n => matches.has(n.id) ? 0.82 : connected.has(n.id) ? 0.6 : 0);
   }, [searchQuery]);
 
   return (
@@ -858,12 +945,41 @@ function NetworkMap() {
           onChange={e => setMinWeight(+e.target.value)}
           style={{width: '100%', marginBottom: '16px', accentColor: '#8b5cf6'}} />
         <div style={{borderTop: '1px solid #1a1a2e', paddingTop: '12px'}}>
-          {Object.entries(TYPE_COLORS).map(([type, color]) => (
-            <div key={type} style={{display: 'flex', alignItems: 'center', marginBottom: '6px', fontSize: '12px'}}>
-              <div className="legend-dot" style={{background: color, marginRight: '8px'}}></div>
-              <span style={{textTransform: 'capitalize'}}>{type.replace('_', ' ')}</span>
-            </div>
-          ))}
+          <div style={{fontSize: '11px', color: '#555', marginBottom: '8px', textTransform: 'uppercase',
+            letterSpacing: '0.5px'}}>Filter by type</div>
+          {Object.entries(TYPE_COLORS).map(([type, color]) => {
+            const active = activeTypes.has(type);
+            return (
+              <div key={type} onClick={() => toggleType(type)}
+                style={{display: 'flex', alignItems: 'center', marginBottom: '5px', fontSize: '12px',
+                  cursor: 'pointer', padding: '4px 6px', borderRadius: '4px', userSelect: 'none',
+                  background: active ? 'rgba(255,255,255,0.04)' : 'transparent',
+                  opacity: active ? 1 : 0.35,
+                  transition: 'opacity 0.15s, background 0.15s'}}>
+                <div style={{width: '10px', height: '10px', borderRadius: '50%',
+                  background: active ? color : '#333',
+                  marginRight: '8px', flexShrink: 0,
+                  boxShadow: active ? '0 0 5px ' + color + '88' : 'none',
+                  transition: 'background 0.15s, box-shadow 0.15s'}}></div>
+                <span style={{textTransform: 'capitalize', color: active ? '#ccc' : '#555'}}>
+                  {type.replace('_', ' ')}
+                </span>
+                {active && <span style={{marginLeft: 'auto', fontSize: '10px', color: color, fontWeight: 600}}>✓</span>}
+              </div>
+            );
+          })}
+          <div style={{marginTop: '8px', display: 'flex', gap: '6px'}}>
+            <button onClick={() => setActiveTypes(new Set(Object.keys(TYPE_COLORS)))}
+              style={{flex: 1, padding: '4px 0', fontSize: '10px', background: 'transparent',
+                color: '#555', border: '1px solid #222', borderRadius: '4px', cursor: 'pointer'}}>
+              All
+            </button>
+            <button onClick={() => setActiveTypes(new Set([Object.keys(TYPE_COLORS)[0]]))}
+              style={{flex: 1, padding: '4px 0', fontSize: '10px', background: 'transparent',
+                color: '#555', border: '1px solid #222', borderRadius: '4px', cursor: 'pointer'}}>
+              None
+            </button>
+          </div>
         </div>
         {/* Snapshot info + refresh */}
         <div style={{borderTop: '1px solid #1a1a2e', paddingTop: '12px', marginTop: '4px'}}>
