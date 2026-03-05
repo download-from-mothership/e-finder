@@ -500,6 +500,95 @@ def api_investigate_status(job_id):
     return jsonify(resp)
 
 
+# ─── Timeline state (in-memory) ─────────────────────────────────────
+_timelines = {}  # job_id -> {status, result, error}
+
+
+@app.route("/api/timeline", methods=["POST"])
+def api_timeline():
+    """Start a timeline build for a subject via TimelineBuilderAgent."""
+    data = request.get_json()
+    subject = (data.get("subject") or "").strip()
+    if not subject:
+        return jsonify({"error": "No subject provided"}), 400
+
+    # Return cached result if available (keyed by lower-case subject)
+    cache_key = f"timeline_{subject.lower()}"
+    cached = _cache_get(cache_key)
+    if cached:
+        job_id = "cached_" + cache_key
+        _timelines[job_id] = {"status": "complete", "result": cached, "error": None}
+        return jsonify({"job_id": job_id, "status": "complete"})
+
+    job_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    _timelines[job_id] = {"status": "running", "result": None, "error": None}
+
+    def run_timeline(jid, subj):
+        try:
+            swarm_dir = os.path.dirname(os.path.abspath(__file__))
+            if swarm_dir not in sys.path:
+                sys.path.insert(0, swarm_dir)
+            import anthropic
+            from swarm import TimelineBuilderAgent
+
+            db = get_db()
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY not set in environment")
+            claude_client = anthropic.Anthropic(api_key=api_key)
+
+            agent = TimelineBuilderAgent(db=db, claude_client=claude_client)
+            agent_result = agent.run({"subject": subj})
+
+            # Extract the timeline finding
+            timeline_data = None
+            for finding in (agent_result.findings or []):
+                if isinstance(finding, dict) and finding.get("type") == "timeline":
+                    timeline_data = finding.get("data", {})
+                    break
+
+            if timeline_data is None:
+                # Fallback: wrap raw findings
+                timeline_data = {
+                    "subject": subj,
+                    "timeline": [],
+                    "date_range": "unknown",
+                    "gaps": [],
+                    "patterns": [],
+                    "total_documents": 0,
+                    "error": agent_result.error or "No timeline data returned",
+                    "raw_findings": agent_result.findings,
+                }
+
+            timeline_data["_agent_duration"] = round(agent_result.duration_seconds or 0, 1)
+            _timelines[jid]["status"] = "complete"
+            _timelines[jid]["result"] = timeline_data
+            # Cache for 10 minutes
+            _cache_set(f"timeline_{subj.lower()}", timeline_data, ttl=600)
+        except Exception as exc:
+            _timelines[jid]["status"] = "error"
+            _timelines[jid]["error"] = str(exc)
+
+    t = threading.Thread(target=run_timeline, args=(job_id, subject))
+    t.daemon = True
+    t.start()
+    return jsonify({"job_id": job_id, "status": "running"})
+
+
+@app.route("/api/timeline/<job_id>")
+def api_timeline_status(job_id):
+    """Poll timeline build status."""
+    job = _timelines.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job"}), 404
+    resp = {"job_id": job_id, "status": job["status"]}
+    if job["status"] == "complete" and job["result"]:
+        resp["result"] = job["result"]
+    elif job["status"] == "error":
+        resp["error"] = job["error"]
+    return jsonify(resp)
+
+
 # ─── Main Page ────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -1394,12 +1483,403 @@ function EntitiesPage() {
   );
 }
 
+// ─── Timeline Page ───
+const SIG_COLORS = { high: '#ef4444', medium: '#f59e0b', low: '#6b7280' };
+const SIG_LABELS = { high: 'HIGH', medium: 'MED', low: 'LOW' };
+
+function TimelineEventCard({ event, index, isLast }) {
+  const [expanded, setExpanded] = useState(false);
+  const sig = (event.significance || 'low').toLowerCase();
+  const sigColor = SIG_COLORS[sig] || SIG_COLORS.low;
+  const sigLabel = SIG_LABELS[sig] || 'LOW';
+  const docCount = (event.doc_ids || []).length;
+  return (
+    <div style={{display: 'flex', gap: '0'}}>
+      {/* Spine */}
+      <div style={{display: 'flex', flexDirection: 'column', alignItems: 'center', width: '40px', flexShrink: 0}}>
+        <div style={{width: '12px', height: '12px', borderRadius: '50%',
+          background: sigColor, border: `2px solid ${sigColor}44`,
+          boxShadow: `0 0 8px ${sigColor}66`, flexShrink: 0, marginTop: '4px'}}></div>
+        {!isLast && <div style={{width: '2px', flex: 1, background: 'linear-gradient(to bottom, #2a2a4e, #1a1a2e)', minHeight: '24px', marginTop: '4px'}}></div>}
+      </div>
+      {/* Card */}
+      <div className="card" onClick={() => setExpanded(!expanded)}
+        style={{flex: 1, padding: '14px 16px', marginBottom: '12px', cursor: 'pointer',
+          borderLeft: `3px solid ${sigColor}55`, transition: 'border-color 0.2s',
+          borderColor: expanded ? sigColor : undefined}}>
+        <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px'}}>
+          <div style={{flex: 1}}>
+            <div style={{display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px', flexWrap: 'wrap'}}>
+              <span style={{fontSize: '12px', fontWeight: 700, color: '#a78bfa',
+                fontFamily: 'monospace', letterSpacing: '0.5px'}}>{event.date || 'Unknown date'}</span>
+              <span style={{fontSize: '10px', fontWeight: 700, color: sigColor,
+                background: `${sigColor}18`, border: `1px solid ${sigColor}44`,
+                borderRadius: '4px', padding: '1px 6px', letterSpacing: '0.5px'}}>{sigLabel}</span>
+              {docCount > 0 && (
+                <span style={{fontSize: '10px', color: '#555',
+                  background: '#111', border: '1px solid #222',
+                  borderRadius: '4px', padding: '1px 6px'}}>
+                  {docCount} doc{docCount !== 1 ? 's' : ''}
+                </span>
+              )}
+            </div>
+            <div style={{fontSize: '13px', color: '#ddd', lineHeight: '1.5'}}>
+              {event.event || 'No description'}
+            </div>
+          </div>
+          <div style={{fontSize: '16px', color: '#444', flexShrink: 0, marginTop: '2px'}}>
+            {expanded ? '▲' : '▼'}
+          </div>
+        </div>
+        {expanded && docCount > 0 && (
+          <div style={{marginTop: '10px', paddingTop: '10px', borderTop: '1px solid #1a1a2e'}}>
+            <div style={{fontSize: '11px', color: '#555', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.5px'}}>Source Documents</div>
+            <div style={{display: 'flex', flexWrap: 'wrap', gap: '6px'}}>
+              {(event.doc_ids || []).map((id, i) => (
+                <span key={i} style={{fontSize: '10px', color: '#8b5cf6',
+                  background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.2)',
+                  borderRadius: '4px', padding: '2px 8px', fontFamily: 'monospace'}}>{id}</span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function GapCard({ gap }) {
+  return (
+    <div style={{display: 'flex', gap: '0', opacity: 0.7}}>
+      <div style={{display: 'flex', flexDirection: 'column', alignItems: 'center', width: '40px', flexShrink: 0}}>
+        <div style={{width: '2px', flex: 1, background: 'repeating-linear-gradient(to bottom, #333 0px, #333 6px, transparent 6px, transparent 12px)', minHeight: '40px'}}></div>
+      </div>
+      <div style={{flex: 1, marginBottom: '12px', padding: '10px 14px',
+        background: 'rgba(251,191,36,0.04)', border: '1px dashed #3a3a1e',
+        borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '10px'}}>
+        <span style={{fontSize: '16px', opacity: 0.6}}>⚠️</span>
+        <div>
+          <div style={{fontSize: '11px', color: '#f59e0b', fontWeight: 600, marginBottom: '2px', textTransform: 'uppercase', letterSpacing: '0.5px'}}>Gap: {gap.from} → {gap.to}</div>
+          <div style={{fontSize: '12px', color: '#888'}}>{gap.note || 'Unexplained gap in records'}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TimelinePage() {
+  const { data: topPeople } = useFetch('/api/top-entities?type=person&limit=50');
+  const [subject, setSubject] = useState('');
+  const [inputValue, setInputValue] = useState('');
+  const [suggestions, setSuggestions] = useState([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [jobId, setJobId] = useState(null);
+  const [status, setStatus] = useState(null); // null | 'running' | 'complete' | 'error'
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [sigFilter, setSigFilter] = useState('all');
+  const inputRef = useRef(null);
+
+  const PRESETS = [
+    'Jeffrey Epstein', 'Ghislaine Maxwell', 'Prince Andrew',
+    'Alan Dershowitz', 'Leslie Wexner', 'Jean-Luc Brunel',
+  ];
+
+  // Autocomplete from top-entities
+  useEffect(() => {
+    if (!inputValue || !topPeople) { setSuggestions([]); return; }
+    const q = inputValue.toLowerCase();
+    const matches = topPeople.filter(p => p.name.toLowerCase().includes(q)).slice(0, 8);
+    setSuggestions(matches);
+  }, [inputValue, topPeople]);
+
+  function handleRun(subj) {
+    const s = (subj || inputValue).trim();
+    if (!s) return;
+    setSubject(s);
+    setInputValue(s);
+    setShowSuggestions(false);
+    setStatus('running');
+    setResult(null);
+    setError(null);
+    setElapsed(0);
+    const startTime = Date.now();
+    const timer = setInterval(() => setElapsed(((Date.now() - startTime) / 1000).toFixed(1)), 500);
+
+    fetch('/api/timeline', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({subject: s}),
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'complete') {
+        // Cached result returned immediately — fetch the full result
+        clearInterval(timer);
+        fetch(`/api/timeline/${data.job_id}`).then(r => r.json()).then(d => {
+          setStatus('complete');
+          setResult(d.result || {});
+        }).catch(() => { setStatus('complete'); setResult({}); });
+        return;
+      }
+      const jid = data.job_id;
+      setJobId(jid);
+      const poll = setInterval(() => {
+        fetch(`/api/timeline/${jid}`).then(r => r.json()).then(d => {
+          if (d.status === 'complete') {
+            clearInterval(poll); clearInterval(timer);
+            setStatus('complete');
+            setResult(d.result || {});
+          } else if (d.status === 'error') {
+            clearInterval(poll); clearInterval(timer);
+            setStatus('error');
+            setError(d.error || 'Unknown error');
+          }
+        });
+      }, 2000);
+    })
+    .catch(e => { setStatus('error'); setError(e.message); clearInterval(timer); });
+  }
+
+  // Merge gaps into timeline for display
+  function buildDisplayItems(tl, gaps) {
+    if (!tl || tl.length === 0) return [];
+    const items = tl.map(e => ({...e, _type: 'event'}));
+    // Insert gaps between events where applicable
+    if (gaps && gaps.length > 0) {
+      const result = [];
+      for (let i = 0; i < items.length; i++) {
+        result.push(items[i]);
+        if (i < items.length - 1) {
+          const gap = gaps.find(g => g.from && g.to &&
+            items[i].date && items[i+1].date &&
+            g.from >= items[i].date && g.to <= items[i+1].date);
+          if (gap) result.push({...gap, _type: 'gap'});
+        }
+      }
+      return result;
+    }
+    return items;
+  }
+
+  const timeline = result?.timeline || [];
+  const gaps = result?.gaps || [];
+  const patterns = result?.patterns || [];
+  const displayItems = buildDisplayItems(timeline, gaps);
+  const filteredItems = sigFilter === 'all'
+    ? displayItems
+    : displayItems.filter(item => item._type === 'gap' || (item.significance || 'low').toLowerCase() === sigFilter);
+
+  const highCount = timeline.filter(e => (e.significance || '').toLowerCase() === 'high').length;
+  const medCount  = timeline.filter(e => (e.significance || '').toLowerCase() === 'medium').length;
+  const lowCount  = timeline.filter(e => (e.significance || '').toLowerCase() === 'low').length;
+
+  return (
+    <div style={{maxWidth: '900px', margin: '0 auto', padding: '32px 24px'}}>
+      <h2 style={{fontSize: '20px', fontWeight: 600, color: '#fff', marginBottom: '4px'}}>Timeline View</h2>
+      <p style={{fontSize: '14px', color: '#666', marginBottom: '24px'}}>
+        Reconstruct a chronological narrative for any person or topic from the corpus
+      </p>
+
+      {/* Search bar */}
+      <div style={{position: 'relative', marginBottom: '16px'}}>
+        <div style={{display: 'flex', gap: '8px'}}>
+          <div style={{flex: 1, position: 'relative'}}>
+            <input ref={inputRef} type="text" value={inputValue}
+              onChange={e => { setInputValue(e.target.value); setShowSuggestions(true); }}
+              onKeyDown={e => {
+                if (e.key === 'Enter') { handleRun(inputValue); }
+                if (e.key === 'Escape') setShowSuggestions(false);
+              }}
+              onFocus={() => setShowSuggestions(true)}
+              onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
+              placeholder="Search for a person or topic..."
+              style={{width: '100%', background: '#0a0a12', border: '1px solid #333',
+                borderRadius: '8px', padding: '10px 14px', fontSize: '14px',
+                color: '#e0e0e0', outline: 'none'}} />
+            {showSuggestions && suggestions.length > 0 && (
+              <div style={{position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 100,
+                background: '#0f0f1a', border: '1px solid #2a2a4e', borderRadius: '8px',
+                marginTop: '4px', overflow: 'hidden', boxShadow: '0 8px 24px rgba(0,0,0,0.6)'}}>
+                {suggestions.map((s, i) => (
+                  <div key={i}
+                    onMouseDown={() => { setInputValue(s.name); setShowSuggestions(false); }}
+                    style={{padding: '9px 14px', fontSize: '13px', cursor: 'pointer',
+                      display: 'flex', alignItems: 'center', gap: '10px',
+                      borderBottom: i < suggestions.length - 1 ? '1px solid #1a1a2e' : 'none'}}
+                    onMouseEnter={e => e.currentTarget.style.background = '#1a1a2e'}
+                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                    <div style={{width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
+                      background: TYPE_COLORS[s.type] || TYPE_COLORS.other}}></div>
+                    <span style={{color: '#ddd', flex: 1}}>{s.name}</span>
+                    <span style={{fontSize: '11px', color: '#555'}}>{s.count.toLocaleString()} docs</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <button onClick={() => handleRun(inputValue)} disabled={!inputValue.trim() || status === 'running'}
+            style={{padding: '10px 20px', background: status === 'running' ? '#333' : '#8b5cf6',
+              color: status === 'running' ? '#888' : '#fff', border: 'none', borderRadius: '8px',
+              fontSize: '13px', fontWeight: 600, cursor: status === 'running' ? 'default' : 'pointer',
+              whiteSpace: 'nowrap'}}>
+            {status === 'running' ? `Building... (${elapsed}s)` : 'Build Timeline'}
+          </button>
+        </div>
+      </div>
+
+      {/* Preset chips */}
+      {!result && status !== 'running' && (
+        <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '24px'}}>
+          <span style={{fontSize: '12px', color: '#555', alignSelf: 'center', marginRight: '4px'}}>Quick select:</span>
+          {PRESETS.map(p => (
+            <button key={p} onClick={() => handleRun(p)}
+              style={{padding: '5px 12px', fontSize: '12px', background: '#111',
+                border: '1px solid #2a2a4e', borderRadius: '20px', color: '#a78bfa',
+                cursor: 'pointer', fontWeight: 500}}>
+              {p}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Running state */}
+      {status === 'running' && (
+        <div className="card" style={{padding: '24px', textAlign: 'center', marginBottom: '24px'}}>
+          <div style={{display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px', marginBottom: '12px'}}>
+            <div style={{width: '10px', height: '10px', background: '#8b5cf6', borderRadius: '50%',
+              animation: 'pulse 1.5s infinite'}}></div>
+            <span style={{fontSize: '14px', color: '#a78bfa', fontWeight: 500}}>
+              Building timeline for "{subject}"...
+            </span>
+          </div>
+          <div style={{fontSize: '12px', color: '#555', lineHeight: '1.8'}}>
+            <div>Searching entity index for matching documents...</div>
+            <div>Extracting date events from document metadata...</div>
+            <div>Synthesizing chronological narrative with Claude...</div>
+          </div>
+          <div style={{marginTop: '12px', fontSize: '12px', color: '#444'}}>{elapsed}s elapsed</div>
+        </div>
+      )}
+
+      {/* Error state */}
+      {status === 'error' && (
+        <div style={{border: '1px solid #ef4444', background: 'rgba(239,68,68,0.05)',
+          borderRadius: '8px', padding: '16px', fontSize: '13px', color: '#f87171', marginBottom: '24px'}}>
+          Error: {error}
+        </div>
+      )}
+
+      {/* Results */}
+      {status === 'complete' && result && (
+        <div>
+          {/* Header */}
+          <div className="card" style={{padding: '20px', marginBottom: '24px'}}>
+            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '12px'}}>
+              <div>
+                <div style={{fontSize: '18px', fontWeight: 700, color: '#fff', marginBottom: '4px'}}>
+                  {result.subject || subject}
+                </div>
+                <div style={{fontSize: '13px', color: '#666'}}>
+                  {result.date_range || 'Date range unknown'}
+                  {result.total_documents ? ` · ${result.total_documents} source documents` : ''}
+                  {result._agent_duration ? ` · ${result._agent_duration}s` : ''}
+                </div>
+              </div>
+              <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap'}}>
+                {[['all', '#8b5cf6', `All (${timeline.length})`],
+                  ['high', '#ef4444', `High (${highCount})`],
+                  ['medium', '#f59e0b', `Med (${medCount})`],
+                  ['low', '#6b7280', `Low (${lowCount})`]].map(([val, col, lbl]) => (
+                  <button key={val} onClick={() => setSigFilter(val)}
+                    style={{padding: '5px 12px', fontSize: '11px', fontWeight: 600,
+                      borderRadius: '6px', border: `1px solid ${sigFilter === val ? col : '#222'}`,
+                      background: sigFilter === val ? `${col}18` : '#111',
+                      color: sigFilter === val ? col : '#555', cursor: 'pointer'}}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {result.error && (
+              <div style={{marginTop: '12px', fontSize: '12px', color: '#f59e0b',
+                background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.2)',
+                borderRadius: '6px', padding: '8px 12px'}}>
+                Note: {result.error}
+              </div>
+            )}
+          </div>
+
+          {/* Timeline */}
+          {filteredItems.length === 0 ? (
+            <div className="card" style={{padding: '40px', textAlign: 'center', color: '#555'}}>
+              No events found{sigFilter !== 'all' ? ` with ${sigFilter} significance` : ''}.
+            </div>
+          ) : (
+            <div style={{paddingLeft: '8px'}}>
+              {filteredItems.map((item, i) =>
+                item._type === 'gap'
+                  ? <GapCard key={`gap-${i}`} gap={item} />
+                  : <TimelineEventCard key={`evt-${i}`} event={item}
+                      index={i} isLast={i === filteredItems.length - 1} />
+              )}
+            </div>
+          )}
+
+          {/* Gaps section (standalone if not interleaved) */}
+          {gaps.length > 0 && filteredItems.every(i => i._type !== 'gap') && (
+            <div className="card" style={{padding: '20px', marginTop: '24px'}}>
+              <div style={{fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px',
+                color: '#f59e0b', fontWeight: 600, marginBottom: '12px'}}>Identified Gaps</div>
+              {gaps.map((g, i) => (
+                <div key={i} style={{display: 'flex', gap: '10px', alignItems: 'flex-start',
+                  padding: '10px 0', borderBottom: i < gaps.length - 1 ? '1px solid #1a1a2e' : 'none'}}>
+                  <span style={{fontSize: '12px', color: '#f59e0b', fontWeight: 600, minWidth: '160px', flexShrink: 0}}>
+                    {g.from} → {g.to}
+                  </span>
+                  <span style={{fontSize: '12px', color: '#888'}}>{g.note}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Patterns */}
+          {patterns.length > 0 && (
+            <div className="card" style={{padding: '20px', marginTop: '16px'}}>
+              <div style={{fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px',
+                color: '#8b5cf6', fontWeight: 600, marginBottom: '12px'}}>Temporal Patterns</div>
+              {patterns.map((p, i) => (
+                <div key={i} className="finding-card"
+                  style={{padding: '10px 14px', marginBottom: '8px', borderRadius: '0 6px 6px 0',
+                    fontSize: '13px', color: '#ccc', lineHeight: '1.5'}}>
+                  {typeof p === 'string' ? p : JSON.stringify(p)}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Re-run button */}
+          <div style={{textAlign: 'center', marginTop: '24px'}}>
+            <button onClick={() => { setResult(null); setStatus(null); setInputValue(subject); }}
+              style={{padding: '8px 20px', background: 'none', border: '1px solid #333',
+                borderRadius: '8px', color: '#666', fontSize: '13px', cursor: 'pointer'}}>
+              Search another subject
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── App Shell ───
 function App() {
   const [tab, setTab] = useState('overview');
   const tabs = [
     {id: 'overview', label: 'Overview'},
     {id: 'network', label: 'Relationship Map'},
+    {id: 'timeline', label: 'Timeline'},
     {id: 'reports', label: 'Reports'},
     {id: 'entities', label: 'Entities'},
   ];
@@ -1430,6 +1910,7 @@ function App() {
       <div style={{paddingTop: '48px'}}>
         {tab === 'overview' && <OverviewPage onNavigate={setTab} />}
         {tab === 'network' && <NetworkMap />}
+        {tab === 'timeline' && <TimelinePage />}
         {tab === 'reports' && <ReportsPage />}
         {tab === 'entities' && <EntitiesPage />}
       </div>
