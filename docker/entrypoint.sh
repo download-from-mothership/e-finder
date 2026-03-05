@@ -67,6 +67,7 @@ case "$MODE" in
             --workers 1 \
             --threads 8 \
             --timeout 300 \
+            --log-level info \
             --access-logfile - \
             --error-logfile - \
             "dashboard:app"
