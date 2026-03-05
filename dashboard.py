@@ -48,6 +48,12 @@ MAX_NODES = 300
 MAX_EDGES = 2000
 MIN_EDGE_WEIGHT = 2
 
+# Path for the persistent on-disk network snapshot (survives restarts)
+# Stored next to dashboard.py so it persists across container restarts
+_NETWORK_SNAPSHOT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "network_snapshot.json"
+)
+
 # ─── App Setup ────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -64,6 +70,103 @@ def _cache_get(key):
 
 def _cache_set(key, value, ttl=600):
     _cache[key] = (value, time.time() + ttl)
+
+
+# ─── Disk-persistent network snapshot ───────────────────────────────
+def _load_network_snapshot():
+    """Load the pre-built network graph from disk. Returns None if absent."""
+    try:
+        if os.path.exists(_NETWORK_SNAPSHOT_PATH):
+            with open(_NETWORK_SNAPSHOT_PATH, "r") as f:
+                data = json.load(f)
+            import logging
+            log = logging.getLogger(__name__)
+            log.info(
+                "Loaded network snapshot from disk (%d nodes, %d edges, built %s)",
+                len(data.get("nodes", [])),
+                len(data.get("edges", [])),
+                data.get("built_at", "unknown"),
+            )
+            return data
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Failed to load network snapshot: %s", exc)
+    return None
+
+
+def _save_network_snapshot(payload):
+    """Persist the network graph to disk with a timestamp."""
+    try:
+        payload["built_at"] = datetime.utcnow().isoformat() + "Z"
+        with open(_NETWORK_SNAPSHOT_PATH, "w") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        import logging
+        logging.getLogger(__name__).info(
+            "Network snapshot saved to disk (%d nodes, %d edges)",
+            len(payload.get("nodes", [])),
+            len(payload.get("edges", [])),
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Failed to save network snapshot: %s", exc)
+
+
+def _build_network_data(db):
+    """Run the full MongoDB queries and return {nodes, edges}. Shared by
+    the pre-warm thread, the /api/network endpoint, and the refresh endpoint."""
+    min_weight = MIN_EDGE_WEIGHT
+    max_nodes = MAX_NODES
+
+    edges_raw = list(db["network"].find(
+        {"weight": {"$gte": min_weight}},
+        {"person1": 1, "person2": 1, "weight": 1, "shared_doc_ids": 1, "_id": 0}
+    ).sort("weight", -1))
+
+    node_degree = defaultdict(int)
+    node_weighted_degree = defaultdict(int)
+    for e in edges_raw:
+        node_degree[e["person1"]] += 1
+        node_degree[e["person2"]] += 1
+        node_weighted_degree[e["person1"]] += e["weight"]
+        node_weighted_degree[e["person2"]] += e["weight"]
+
+    top_nodes = sorted(node_weighted_degree.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+    node_set = set(n for n, _ in top_nodes)
+
+    edges = []
+    for e in edges_raw:
+        if e["person1"] in node_set and e["person2"] in node_set:
+            edges.append({
+                "source": e["person1"],
+                "target": e["person2"],
+                "weight": e["weight"],
+                "docs": len(e.get("shared_doc_ids", [])),
+            })
+            if len(edges) >= MAX_EDGES:
+                break
+
+    nodes = []
+    for name in node_set:
+        doc_count = db["entities"].count_documents({"name": name, "entity_type": "person"})
+        section_pipeline = [
+            {"$match": {"name": name, "entity_type": "person"}},
+            {"$group": {"_id": "$section", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 3},
+        ]
+        sections = [r["_id"] for r in db["entities"].aggregate(section_pipeline)]
+        node_type, role_str = _classify_person_role(db, name)
+        nodes.append({
+            "id": name,
+            "doc_count": doc_count,
+            "degree": node_degree[name],
+            "weighted_degree": node_weighted_degree[name],
+            "sections": sections,
+            "role": role_str[:150],
+            "type": node_type,
+        })
+
+    return {"nodes": nodes, "edges": edges}
 
 
 def _prewarm_cache():
@@ -86,62 +189,22 @@ def _prewarm_cache():
         _cache_set("stats", result, ttl=120)
         log.info("Cache pre-warm: stats done")
 
-        # Pre-warm network graph (slow — 600+ queries, run in background)
-        min_weight = MIN_EDGE_WEIGHT
-        max_nodes = MAX_NODES
-        cache_key = f"network_{min_weight}_{max_nodes}"
-
-        edges_raw = list(db["network"].find(
-            {"weight": {"$gte": min_weight}},
-            {"person1": 1, "person2": 1, "weight": 1, "shared_doc_ids": 1, "_id": 0}
-        ).sort("weight", -1))
-
-        node_degree = defaultdict(int)
-        node_weighted_degree = defaultdict(int)
-        for e in edges_raw:
-            node_degree[e["person1"]] += 1
-            node_degree[e["person2"]] += 1
-            node_weighted_degree[e["person1"]] += e["weight"]
-            node_weighted_degree[e["person2"]] += e["weight"]
-
-        top_nodes = sorted(node_weighted_degree.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-        node_set = set(n for n, _ in top_nodes)
-
-        edges = []
-        for e in edges_raw:
-            if e["person1"] in node_set and e["person2"] in node_set:
-                edges.append({
-                    "source": e["person1"],
-                    "target": e["person2"],
-                    "weight": e["weight"],
-                    "docs": len(e.get("shared_doc_ids", [])),
-                })
-                if len(edges) >= MAX_EDGES:
-                    break
-
-        nodes = []
-        for name in node_set:
-            doc_count = db["entities"].count_documents({"name": name, "entity_type": "person"})
-            section_pipeline = [
-                {"$match": {"name": name, "entity_type": "person"}},
-                {"$group": {"_id": "$section", "count": {"$sum": 1}}},
-                {"$sort": {"count": -1}},
-                {"$limit": 3},
-            ]
-            sections = [r["_id"] for r in db["entities"].aggregate(section_pipeline)]
-            node_type, role_str = _classify_person_role(db, name)
-            nodes.append({
-                "id": name,
-                "doc_count": doc_count,
-                "degree": node_degree[name],
-                "weighted_degree": node_weighted_degree[name],
-                "sections": sections,
-                "role": role_str[:150],
-                "type": node_type,
-            })
-
-        _cache_set(cache_key, {"nodes": nodes, "edges": edges}, ttl=600)
-        log.info("Cache pre-warm: network graph done (%d nodes, %d edges)", len(nodes), len(edges))
+        # Pre-warm network graph — use disk snapshot if available, otherwise build & save
+        cache_key = f"network_{MIN_EDGE_WEIGHT}_{MAX_NODES}"
+        snapshot = _load_network_snapshot()
+        if snapshot:
+            # Disk snapshot exists — load into memory cache instantly (no MongoDB queries)
+            _cache_set(cache_key, snapshot, ttl=86400)  # 24 h TTL; refreshed on demand
+            log.info("Cache pre-warm: network loaded from disk snapshot")
+        else:
+            # No snapshot yet — build from MongoDB and persist to disk
+            log.info("Cache pre-warm: no network snapshot found, building from MongoDB...")
+            network_data = _build_network_data(db)
+            _cache_set(cache_key, network_data, ttl=86400)
+            _save_network_snapshot(network_data)
+            log.info("Cache pre-warm: network graph built and saved (%d nodes, %d edges)",
+                     len(network_data["nodes"]), len(network_data["edges"]))
+        log.info("Cache pre-warm: network graph done")
 
         # Pre-warm entity breakdown (fast aggregation)
         eb_pipeline = [
@@ -241,66 +304,65 @@ def api_stats():
 
 @app.route("/api/network")
 def api_network():
+    """Serve the relationship network graph.
+
+    Priority order:
+      1. In-memory TTL cache (fastest — microseconds)
+      2. Disk snapshot (fast — milliseconds, survives restarts)
+      3. Build from MongoDB (slow — ~30-60 s, only on first-ever run)
+    """
+    # Only the default parameters are covered by the persistent snapshot.
+    # Custom min_weight / max_nodes still fall through to a live build.
     min_weight = int(request.args.get("min_weight", MIN_EDGE_WEIGHT))
     max_nodes = int(request.args.get("max_nodes", MAX_NODES))
     cache_key = f"network_{min_weight}_{max_nodes}"
+
+    # 1. In-memory cache hit
     cached = _cache_get(cache_key)
     if cached:
         return jsonify(cached)
+
+    # 2. Disk snapshot (default params only)
+    if min_weight == MIN_EDGE_WEIGHT and max_nodes == MAX_NODES:
+        snapshot = _load_network_snapshot()
+        if snapshot:
+            _cache_set(cache_key, snapshot, ttl=86400)
+            return jsonify(snapshot)
+
+    # 3. Build from MongoDB (first run or custom params)
     db = get_db()
-
-    edges_raw = list(db["network"].find(
-        {"weight": {"$gte": min_weight}},
-        {"person1": 1, "person2": 1, "weight": 1, "shared_doc_ids": 1, "_id": 0}
-    ).sort("weight", -1))
-
-    node_degree = defaultdict(int)
-    node_weighted_degree = defaultdict(int)
-    for e in edges_raw:
-        node_degree[e["person1"]] += 1
-        node_degree[e["person2"]] += 1
-        node_weighted_degree[e["person1"]] += e["weight"]
-        node_weighted_degree[e["person2"]] += e["weight"]
-
-    top_nodes = sorted(node_weighted_degree.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-    node_set = set(n for n, _ in top_nodes)
-
-    edges = []
-    for e in edges_raw:
-        if e["person1"] in node_set and e["person2"] in node_set:
-            edges.append({
-                "source": e["person1"],
-                "target": e["person2"],
-                "weight": e["weight"],
-                "docs": len(e.get("shared_doc_ids", [])),
-            })
-            if len(edges) >= MAX_EDGES:
-                break
-
-    nodes = []
-    for name in node_set:
-        doc_count = db["entities"].count_documents({"name": name, "entity_type": "person"})
-        section_pipeline = [
-            {"$match": {"name": name, "entity_type": "person"}},
-            {"$group": {"_id": "$section", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-            {"$limit": 3},
-        ]
-        sections = [r["_id"] for r in db["entities"].aggregate(section_pipeline)]
-        node_type, role_str = _classify_person_role(db, name)
-        nodes.append({
-            "id": name,
-            "doc_count": doc_count,
-            "degree": node_degree[name],
-            "weighted_degree": node_weighted_degree[name],
-            "sections": sections,
-            "role": role_str[:150],
-            "type": node_type,
-        })
-
-    result = {"nodes": nodes, "edges": edges}
-    _cache_set(cache_key, result, ttl=600)  # cache for 10 minutes
+    result = _build_network_data(db)
+    _cache_set(cache_key, result, ttl=86400)
+    # Persist to disk if this is the default view
+    if min_weight == MIN_EDGE_WEIGHT and max_nodes == MAX_NODES:
+        _save_network_snapshot(result)
     return jsonify(result)
+
+
+@app.route("/api/network/refresh", methods=["POST"])
+def api_network_refresh():
+    """Force-rebuild the network snapshot from MongoDB and update the disk cache.
+    Call this after ingesting new documents into the corpus.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    def _do_refresh():
+        try:
+            db = get_db()
+            log.info("Network refresh: rebuilding from MongoDB...")
+            data = _build_network_data(db)
+            cache_key = f"network_{MIN_EDGE_WEIGHT}_{MAX_NODES}"
+            _cache_set(cache_key, data, ttl=86400)
+            _save_network_snapshot(data)
+            log.info("Network refresh: complete (%d nodes, %d edges)",
+                     len(data["nodes"]), len(data["edges"]))
+        except Exception as exc:
+            log.error("Network refresh failed: %s", exc)
+
+    t = threading.Thread(target=_do_refresh, daemon=True)
+    t.start()
+    return jsonify({"status": "rebuilding", "message": "Network snapshot rebuild started in background. Check logs for completion."})
 
 
 @app.route("/api/reports")
@@ -565,17 +627,45 @@ function NetworkMap() {
   const [searchQuery, setSearchQuery] = useState('');
   const [minDegree, setMinDegree] = useState(2);
   const [minWeight, setMinWeight] = useState(2);
+  const [snapshotBuiltAt, setSnapshotBuiltAt] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
   const simRef = useRef(null);
   const dataRef = useRef(null);
 
   useEffect(() => {
     fetch('/api/network').then(r => r.json()).then(data => {
       setLoading(false);
-      dataRef.current = data;
+      if (data.built_at) setSnapshotBuiltAt(data.built_at);
       buildGraph(data);
     });
     return () => { if (simRef.current) simRef.current.stop(); };
   }, []);
+
+  function handleRefresh() {
+    if (refreshing) return;
+    setRefreshing(true);
+    fetch('/api/network/refresh', {method: 'POST'})
+      .then(r => r.json())
+      .then(() => {
+        // Poll until the in-memory cache is busted (snapshot rebuilt)
+        const poll = setInterval(() => {
+          fetch('/api/network?_t=' + Date.now())
+            .then(r => r.json())
+            .then(data => {
+              if (data.built_at && data.built_at !== snapshotBuiltAt) {
+                clearInterval(poll);
+                setRefreshing(false);
+                setSnapshotBuiltAt(data.built_at);
+                if (simRef.current) simRef.current.stop();
+                buildGraph(data);
+              }
+            });
+        }, 5000);
+        // Safety timeout after 10 minutes
+        setTimeout(() => { clearInterval(poll); setRefreshing(false); }, 600000);
+      })
+      .catch(() => setRefreshing(false));
+  }
 
   function buildGraph(data) {
     const svg = d3.select(svgRef.current);
@@ -598,13 +688,39 @@ function NetworkMap() {
     const edgeWidthScale = d3.scaleLinear()
       .domain([1, d3.max(edges, d => d.weight) || 1]).range([0.3, 3]);
 
+    // ── Pre-settle the simulation off-screen before first paint ──────────
+    // Run the physics headlessly (no DOM ticks) so the graph appears already
+    // in a stable layout rather than animating from a random starting state.
+    // alphaMin default is 0.001; we stop early at 0.01 for speed (~200 ticks).
+    const presettleWidth = 1200;  // virtual canvas size for pre-settle
+    const presettleHeight = 800;
+    const presim = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(edges).id(d => d.id).distance(80)
+        .strength(d => Math.min(d.weight / 20, 0.5)))
+      .force("charge", d3.forceManyBody().strength(-120))
+      .force("center", d3.forceCenter(presettleWidth / 2, presettleHeight / 2))
+      .force("collision", d3.forceCollide().radius(d => sizeScale(d.weighted_degree) + 2))
+      .alphaDecay(0.04)  // faster decay for pre-settle
+      .stop();
+    // Tick until stable (max 300 iterations)
+    const maxTicks = 300;
+    for (let i = 0; i < maxTicks && presim.alpha() > 0.01; i++) presim.tick();
+    // Translate pre-settled positions to actual canvas centre
+    const xExtent = d3.extent(nodes, d => d.x);
+    const yExtent = d3.extent(nodes, d => d.y);
+    const xOffset = width / 2 - (xExtent[0] + xExtent[1]) / 2;
+    const yOffset = height / 2 - (yExtent[0] + yExtent[1]) / 2;
+    nodes.forEach(d => { d.x += xOffset; d.y += yOffset; });
+
+    // ── Live simulation for drag/interaction (starts near-stable) ────────
     const simulation = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(edges).id(d => d.id).distance(80)
         .strength(d => Math.min(d.weight / 20, 0.5)))
       .force("charge", d3.forceManyBody().strength(-120))
       .force("center", d3.forceCenter(width / 2, height / 2))
       .force("collision", d3.forceCollide().radius(d => sizeScale(d.weighted_degree) + 2))
-      .alphaDecay(0.02);
+      .alpha(0.05)     // start with very low alpha — nearly settled already
+      .alphaDecay(0.05); // decay quickly to rest
     simRef.current = simulation;
 
     const link = g.append("g").selectAll("line").data(edges).join("line")
@@ -666,21 +782,23 @@ function NetworkMap() {
       label.attr("fill-opacity", 1);
     });
 
-    simulation.on("tick", () => {
+    // Render initial positions immediately (from pre-settle), then let live sim
+    // make tiny adjustments as it decays to rest
+    const applyPositions = () => {
       link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
           .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
       node.attr("cx", d => d.x).attr("cy", d => d.y);
       label.attr("x", d => d.x).attr("y", d => d.y);
-    });
+    };
+    applyPositions();  // paint immediately with pre-settled positions
+    simulation.on("tick", applyPositions);
 
-    // Center on Epstein
-    setTimeout(() => {
-      const ep = nodes.find(n => n.id === "Jeffrey Epstein");
-      if (ep) {
-        const t = d3.zoomIdentity.translate(width/2, height/2).scale(1.5).translate(-ep.x, -ep.y);
-        svg.transition().duration(1000).call(zoom.transform, t);
-      }
-    }, 3000);
+    // Center on Epstein immediately (no delay needed — positions are already set)
+    const ep = nodes.find(n => n.id === "Jeffrey Epstein");
+    if (ep) {
+      const t = d3.zoomIdentity.translate(width/2, height/2).scale(1.5).translate(-ep.x, -ep.y);
+      svg.call(zoom.transform, t);
+    }
 
     // Store refs for search/filter
     dataRef.current = { nodes, edges, node, link, label, sizeScale };
@@ -717,7 +835,10 @@ function NetworkMap() {
   return (
     <div style={{position: 'relative', width: '100%', height: 'calc(100vh - 48px)', background: '#050508'}}>
       {loading && <div style={{position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%,-50%)',
-        color: '#8b5cf6', fontSize: '16px', zIndex: 100}}>Loading network data...</div>}
+        color: '#8b5cf6', fontSize: '16px', zIndex: 100, textAlign: 'center'}}>
+        <div style={{marginBottom: '8px'}}>Loading relationship map…</div>
+        <div style={{fontSize: '12px', color: '#555'}}>Calculating layout — will appear instantly</div>
+      </div>}
       {/* Controls overlay */}
       <div style={{position: 'absolute', top: '16px', left: '16px', zIndex: 100, background: 'rgba(15,15,25,0.95)',
         border: '1px solid #1a1a2e', borderRadius: '8px', padding: '16px', width: '260px', fontSize: '13px'}}>
@@ -743,6 +864,23 @@ function NetworkMap() {
               <span style={{textTransform: 'capitalize'}}>{type.replace('_', ' ')}</span>
             </div>
           ))}
+        </div>
+        {/* Snapshot info + refresh */}
+        <div style={{borderTop: '1px solid #1a1a2e', paddingTop: '12px', marginTop: '4px'}}>
+          {snapshotBuiltAt && (
+            <div style={{fontSize: '11px', color: '#444', marginBottom: '8px', lineHeight: '1.4'}}>
+              Snapshot: {new Date(snapshotBuiltAt).toLocaleDateString(undefined,
+                {month: 'short', day: 'numeric', year: 'numeric'})}
+            </div>
+          )}
+          <button onClick={handleRefresh} disabled={refreshing}
+            style={{width: '100%', padding: '6px 0', fontSize: '11px', fontWeight: 500,
+              background: refreshing ? '#111' : 'rgba(139,92,246,0.12)',
+              color: refreshing ? '#555' : '#8b5cf6',
+              border: '1px solid ' + (refreshing ? '#222' : 'rgba(139,92,246,0.3)'),
+              borderRadius: '4px', cursor: refreshing ? 'default' : 'pointer'}}>
+            {refreshing ? 'Rebuilding…' : 'Rebuild Snapshot'}
+          </button>
         </div>
       </div>
       <svg ref={svgRef} id="network-svg"></svg>
