@@ -64,8 +64,8 @@ case "$MODE" in
         echo ""
         exec gunicorn \
             --bind "0.0.0.0:${DASHBOARD_PORT:-5000}" \
-            --workers 2 \
-            --threads 4 \
+            --workers 1 \
+            --threads 8 \
             --timeout 300 \
             --access-logfile - \
             --error-logfile - \
