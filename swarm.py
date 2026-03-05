@@ -855,29 +855,35 @@ class Coordinator:
         report = self._synthesize(question, results, plan.get("synthesis_strategy", ""))
 
         # Step 4: Courthouse Debate — adversarial validation of key findings
-        try:
-            from courthouse_debate import CourthouseDebate
-            if report.get("key_findings"):
-                print(f"\n  Running Courthouse Debate on {len(report['key_findings'])} findings...")
-                debate = CourthouseDebate(self.claude)
-                # Build evidence map from agent results
-                evidence_by_finding = {}
-                for f in report.get("key_findings", []):
-                    finding_text = f.get("finding", "")
-                    evidence = []
-                    for agent_name, r in results.items():
-                        for ev in (r.evidence or []):
-                            evidence.append(ev)
-                    evidence_by_finding[finding_text] = evidence[:10]
-                report = debate.adjudicate_report(report, evidence_by_finding)
-                cs = report.get("courthouse_summary", {})
-                print(f"  Courthouse: {cs.get('confirmed',0)} confirmed, "
-                      f"{cs.get('contested',0)} contested, "
-                      f"{cs.get('insufficient_evidence',0)} insufficient")
-        except ImportError:
-            pass  # courthouse_debate.py not in path
-        except Exception as e:
-            log.warning("Courthouse debate failed (non-fatal): %s", e)
+        # Only run for medium/complex investigations — skip for simple (too slow, overkill)
+        complexity = plan.get("complexity", "medium")
+        run_courthouse = complexity in ("medium", "complex")
+        if run_courthouse:
+            try:
+                from courthouse_debate import CourthouseDebate
+                if report.get("key_findings"):
+                    print(f"\n  Running Courthouse Debate on {len(report['key_findings'])} findings...")
+                    debate = CourthouseDebate(self.claude)
+                    # Build evidence map from agent results
+                    evidence_by_finding = {}
+                    for f in report.get("key_findings", []):
+                        finding_text = f.get("finding", "")
+                        evidence = []
+                        for agent_name, r in results.items():
+                            for ev in (r.evidence or []):
+                                evidence.append(ev)
+                        evidence_by_finding[finding_text] = evidence[:10]
+                    report = debate.adjudicate_report(report, evidence_by_finding)
+                    cs = report.get("courthouse_summary", {})
+                    print(f"  Courthouse: {cs.get('confirmed',0)} confirmed, "
+                          f"{cs.get('contested',0)} contested, "
+                          f"{cs.get('insufficient_evidence',0)} insufficient")
+            except ImportError:
+                pass  # courthouse_debate.py not in path
+            except Exception as e:
+                log.warning("Courthouse debate failed (non-fatal): %s", e)
+        else:
+            log.info("Skipping Courthouse Debate for simple investigation")
 
         elapsed = time.time() - start
         total_api = sum(r.api_calls for r in results.values()) + 2  # +2 for plan + synthesis
